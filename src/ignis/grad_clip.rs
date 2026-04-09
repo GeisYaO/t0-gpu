@@ -3,7 +3,7 @@
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
-use crate::kfd::GpuBuffer;
+use crate::gpu_backend::GpuBuffer;
 #[cfg(feature = "rocm")]
 use super::tensor::Tensor;
 #[cfg(feature = "rocm")]

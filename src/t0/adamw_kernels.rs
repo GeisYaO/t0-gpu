@@ -165,11 +165,11 @@ mod tests {
             ck.elf.len(), ck.workgroup_size, ck.lds_size);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_adamw_gpu() {
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         use std::sync::{Arc, OnceLock};
 
         struct SyncRt(Arc<GpuRuntime>);

@@ -1010,13 +1010,15 @@ fn lower_tile_op(
 
         // ── WMMA / BF16 ──
         TileOp::ZeroAcc { result } => {
-            // Allocate 8 aligned VGPRs, zero-initialize
-            let acc = k.alloc_vreg_array(8, Alignment::Align8);
-            for j in 0..8u32 {
+            let target = current_target();
+            let format = WmmaFormat::BF16_F32;
+            let acc_regs = format.dst_vreg_count(target);
+            let acc = k.alloc_vreg_array(acc_regs, format.dst_alignment(target));
+            for j in 0..acc_regs {
                 k.v_mov_imm(VReg(acc.0 + j), 0);
             }
             // Register coalesced group: opt passes will preserve contiguity
-            k.mark_coalesced_group(acc, 8);
+            k.mark_coalesced_group(acc, acc_regs);
             val_map.insert(*result, MachineVal::VReg(acc));
         }
 
@@ -1032,14 +1034,19 @@ fn lower_tile_op(
             let va = get_vreg(k, val_map, *a)?;
             let vb = get_vreg(k, val_map, *b)?;
             let vc = get_vreg(k, val_map, *c)?;
-            // Allocate new 8-aligned destination, copy accumulator in
-            let dst = k.alloc_vreg_array(8, Alignment::Align8);
-            for j in 0..8u32 {
+            let target = current_target();
+            let format = WmmaFormat::BF16_F32;
+            let dst_regs = format.dst_vreg_count(target);
+            let c_regs = format.c_vreg_count(target);
+            // Allocate new destination with target-specific WMMA constraints,
+            // then seed it from the incoming accumulator fragment.
+            let dst = k.alloc_vreg_array(dst_regs, format.dst_alignment(target));
+            for j in 0..c_regs {
                 k.v_mov(VReg(dst.0 + j), VReg(vc.0 + j));
             }
             k.wmma_bf16_f32(dst, va, vb, dst);
             // Register coalesced group: opt passes will preserve contiguity
-            k.mark_coalesced_group(dst, 8);
+            k.mark_coalesced_group(dst, dst_regs);
             val_map.insert(*result, MachineVal::VReg(dst));
         }
 
@@ -1052,12 +1059,15 @@ fn lower_tile_op(
 
         TileOp::SplatFragment { result, src } => {
             let v_val = get_vreg(k, val_map, *src)?;
-            let dst = k.alloc_vreg_array(8, Alignment::Align8);
-            for j in 0..8u32 {
+            let target = current_target();
+            let format = WmmaFormat::BF16_F32;
+            let frag_regs = format.a_vreg_count(target);
+            let dst = k.alloc_vreg_array(frag_regs, format.a_alignment(target));
+            for j in 0..frag_regs {
                 k.v_mov(VReg(dst.0 + j), v_val);
             }
             // Register coalesced group: opt passes will preserve contiguity
-            k.mark_coalesced_group(dst, 8);
+            k.mark_coalesced_group(dst, frag_regs);
             val_map.insert(*result, MachineVal::VReg(dst));
         }
 
@@ -1635,11 +1645,11 @@ mod tests {
         eprintln!("✓ silu: SSA → ELF ({} bytes)", elf.unwrap().len());
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_vector_add_gpu() {
         // End-to-end: out[i] = x[i] + y[i]
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let mut f = TileFunc::new("vadd_e2e");
         let x_ptr = f.arg_ptr("x");
@@ -1656,7 +1666,7 @@ mod tests {
         let lowered = lower_elementwise_1d(&f, 128, 1).unwrap();
         let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -1703,7 +1713,7 @@ mod tests {
     }
 
     /// GPU 端到端测试辅助: y = f(x)
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn run_unary_gpu_test(
         name: &str,
         build_fn: fn(&mut TileFunc, Value) -> Value,
@@ -1711,7 +1721,7 @@ mod tests {
         input: &[f32],
         tol: f32,
     ) {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let n = input.len() as u32;
         let mut f = TileFunc::new(name);
@@ -1726,7 +1736,7 @@ mod tests {
         let lowered = lower_elementwise_1d(&f, n, 1).unwrap();
         let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
         let x_buf = device.alloc_vram(n as usize * 4).unwrap();
@@ -1760,32 +1770,32 @@ mod tests {
         eprintln!("✓ {} GPU PASSED (max_rel_err={:.2e}, {} elems)", name, max_err, n);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_silu_gpu() {
         let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
         run_unary_gpu_test("silu", |f, x| f.silu(x), |x| x / (1.0 + (-x).exp()), &input, 1e-3);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_exp_gpu() {
         let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
         run_unary_gpu_test("exp", |f, x| f.exp(x), |x| x.exp(), &input, 1e-3);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_relu_gpu() {
         let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
         run_unary_gpu_test("relu", |f, x| f.relu(x), |x| if x > 0.0 { x } else { 0.0 }, &input, 1e-6);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_multi_wg_vadd_gpu() {
         // 1024 elements, WG_SIZE=128, 8 WGs → tests program_id lowering
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let wg_size = 128u32;
         let n_total = 1024u32;
@@ -1812,7 +1822,7 @@ mod tests {
         let lowered = lower_elementwise_1d(&f, wg_size, 1).unwrap();
         let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -1862,10 +1872,10 @@ mod tests {
 
     /// GPU 端到端测试：for_range 循环
     /// 每个线程计算 sum = 0 + 1 + 2 + 3 = 6, 然后 out[tid] = float(sum)
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_for_range_gpu() {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let n = 64u32;
         let loop_count = 4u32;
@@ -1900,7 +1910,7 @@ mod tests {
 
         let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -1933,7 +1943,7 @@ mod tests {
         eprintln!("✓ for_range GPU PASSED ({} loops × {} threads, all = {})", loop_count, n, expected);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_sin_gpu() {
         // sin(x) for x in [-π..π]
@@ -1941,18 +1951,18 @@ mod tests {
         run_unary_gpu_test("sin", |f, x| f.sin(x), |x| x.sin(), &input, 2e-3);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_cos_gpu() {
         let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
         run_unary_gpu_test("cos", |f, x| f.cos(x), |x| x.cos(), &input, 2e-3);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_lower_cast_bf16_gpu() {
         // Test F32 → BF16 → F32 roundtrip
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let n = 64u32;
         let mut f = TileFunc::new("cast_bf16_rt");
@@ -1968,7 +1978,7 @@ mod tests {
         let lowered = lower_elementwise_1d(&f, n, 1).unwrap();
         let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
         let x_buf = device.alloc_vram(n as usize * 4).unwrap();
@@ -2050,13 +2060,13 @@ mod tests {
     /// GPU correctness test for lower_dot GEMM.
     ///
     /// Run with: timeout 15 cargo test --release --features rocm --lib -- test_lower_dot_gpu --ignored --nocapture --test-threads=1
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     #[ignore] // GPU GEMM may hang on misconfigured kernels — run manually with timeout
     fn test_lower_dot_gpu() {
         // GEMM correctness: Y[M,N] = A[M,K] @ B[N,K]^T  (NT layout, bf16 in, f32 out)
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
 
         let m = 128u32;
         let k_dim = 128u32;
@@ -2198,12 +2208,12 @@ mod tests {
         eprintln!("✓ tiled_gemm: SSA → TileGemm → T0Kernel → ELF ({} bytes)", elf_bytes.len());
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     #[ignore]  // run with: cargo test -- test_lower_tiled_gemm_gpu --ignored --nocapture --test-threads=1
     fn test_lower_tiled_gemm_gpu() {
         // End-to-end GPU test: 128×128×128 GEMM via tiled SSA path
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let m = 128u32;
         let k_dim = 128u32;
@@ -2263,7 +2273,7 @@ mod tests {
         }
 
         // GPU dispatch
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -2434,7 +2444,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════
 
     /// Generic GPU E2E test harness for ElemChain-based kernels.
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn run_elem_chain_gpu_test(
         name: &str,
         func: &TileFunc,
@@ -2444,13 +2454,13 @@ mod tests {
         expected: &[f32],
         tol: f32,
     ) {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let n = expected.len() as u32;
         let lowered = lower_elementwise_1d(func, wg_size, 1).unwrap();
         let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -2510,7 +2520,7 @@ mod tests {
         eprintln!("✓ {} GPU PASSED (max_rel_err={:.2e}, {} elems)", name, max_err, n);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elem_chain_gpu_relu() {
         let n = 256;
@@ -2524,7 +2534,7 @@ mod tests {
         run_elem_chain_gpu_test("relu", &func, 256, &[&input], &[], &expected, 1e-6);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elem_chain_gpu_sigmoid() {
         let n = 256;
@@ -2538,7 +2548,7 @@ mod tests {
         run_elem_chain_gpu_test("sigmoid", &func, 256, &[&input], &[], &expected, 1e-3);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elem_chain_gpu_scale_add() {
         let n = 256;
@@ -2551,7 +2561,7 @@ mod tests {
         run_elem_chain_gpu_test("scale_add", &func, 256, &[&a, &b], &[alpha], &expected, 1e-5);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elem_chain_gpu_swiglu() {
         let n = 256;
@@ -2568,7 +2578,7 @@ mod tests {
         run_elem_chain_gpu_test("swiglu", &func, 256, &[&gate, &up], &[], &expected, 1e-3);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elem_chain_gpu_abs_clip() {
         let n = 256;
@@ -2580,7 +2590,7 @@ mod tests {
         run_elem_chain_gpu_test("abs_clip", &func, 256, &[&input], &[threshold], &expected, 1e-6);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elem_chain_gpu_weight_decay() {
         let n = 256;
@@ -2596,7 +2606,7 @@ mod tests {
         run_elem_chain_gpu_test("weight_decay", &func, 256, &[&w, &grad], &[decay, neg_lr], &expected, 1e-5);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elem_chain_gpu_axpy() {
         let n = 256;
@@ -2615,7 +2625,7 @@ mod tests {
     // ElemChain Performance Benchmark
     // ═══════════════════════════════════════════════════════════
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     #[ignore] // Run: cargo test --release --features rocm -- test_elem_chain_benchmark --ignored --nocapture
     fn test_elem_chain_benchmark() {
@@ -2655,7 +2665,7 @@ mod tests {
         let add_lowered = lower_elementwise_1d(&add_func, wg_size, 1).unwrap();
         let add_elf = add_lowered.kernel.compile(Target::GFX1100).unwrap();
 
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         let load_cfg = KernelLoadConfig { workgroup_size: [wg_size, 1, 1], lds_size: 0 };
 
         let fused_kernel = GpuKernel::load(&rt.device, &fused_elf, &load_cfg).unwrap();

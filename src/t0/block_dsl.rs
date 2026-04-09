@@ -1805,7 +1805,7 @@ mod gpu_tests {
             // If raw KFD also fails, the bug is in the kernel ELF itself.
             eprintln!("[tile_gemm] GpuRuntime path failed. Testing raw KFD...");
 
-            use crate::kfd::{GpuKernel as RawGpuKernel, KernelLoadConfig, DispatchPool};
+            use crate::gpu_backend::{GpuKernel as RawGpuKernel, KernelLoadConfig, DispatchPool};
 
             // Recompile fresh kernel directly from gemm_gen
             let t0k_raw = gemm_gen::generate(&gemm_cfg);

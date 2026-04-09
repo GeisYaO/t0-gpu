@@ -23,7 +23,9 @@
 //!
 //! Reference: AMD ROCm Documentation, LLVM AMDGPU Backend
 
+use crate::llvm_toolchain::{find_clang, find_ld_lld};
 use crate::rdna3_asm::Rdna3Assembler;
+use crate::t0::ir::Target;
 
 /// Kernel configuration for code object generation
 #[derive(Clone, Debug)]
@@ -96,9 +98,9 @@ pub struct KernelDescriptor {
 }
 
 impl KernelDescriptor {
-    /// Create kernel descriptor for GFX11 (RDNA3)
-    pub fn for_gfx11(config: &KernelConfig, code_size: usize) -> Self {
-        // COMPUTE_PGM_RSRC1 encoding for GFX11:
+    /// Create kernel descriptor for the given target.
+    pub fn for_target(config: &KernelConfig, code_size: usize, target: Target) -> Self {
+        // COMPUTE_PGM_RSRC1 encoding:
         // [5:0]   = GRANULATED_WORKITEM_VGPR_COUNT
         //           Wave32: (VGPRs + 7) / 8 - 1 (Granularity 8)
         //           Wave64: (VGPRs + 3) / 4 - 1 (Granularity 4)
@@ -308,6 +310,8 @@ pub struct AmdGpuCodeObject {
     code: Vec<u8>,
     /// Constants section
     rodata: Vec<u8>,
+    /// Target architecture
+    target: Target,
 }
 
 impl AmdGpuCodeObject {
@@ -316,6 +320,11 @@ impl AmdGpuCodeObject {
     /// SAFETY: Panics if ISA code exceeds 64KB (would corrupt GPU I$ state).
     /// Warns if code exceeds 32KB (GFX1100 SQC L1I cache size).
     pub fn from_assembler(asm: &Rdna3Assembler, config: KernelConfig) -> Self {
+        Self::from_assembler_with_target(asm, config, Target::GFX1100)
+    }
+
+    /// Create code object with explicit target.
+    pub fn from_assembler_with_target(asm: &Rdna3Assembler, config: KernelConfig, target: Target) -> Self {
         let code = asm.as_bytes();
         let code_kb = code.len() / 1024;
         if code.len() > 64 * 1024 {
@@ -336,6 +345,7 @@ impl AmdGpuCodeObject {
             config,
             code,
             rodata: Vec::new(),
+            target,
         }
     }
     
@@ -360,7 +370,7 @@ impl AmdGpuCodeObject {
         let mut buf = Vec::with_capacity(8192);
         
         // Build kernel descriptor
-        let kd = KernelDescriptor::for_gfx11(&self.config, self.code.len());
+        let kd = KernelDescriptor::for_target(&self.config, self.code.len(), self.target);
         
         // Sizes
         let elf_header_size = 64;
@@ -470,7 +480,7 @@ impl AmdGpuCodeObject {
             e_entry: 0,
             e_phoff: phdrs_offset as u64,
             e_shoff: shdrs_offset as u64,
-            e_flags: 0x041, // GFX1100
+            e_flags: self.target.elf_flags(),
             e_ehsize: elf_header_size as u16,
             e_phentsize: phdr_size as u16,
             e_phnum: num_phdrs as u16,
@@ -668,7 +678,7 @@ impl AmdGpuCodeObject {
         let mut buf = Vec::with_capacity(16384);
         
         // Build kernel descriptor
-        let kd = KernelDescriptor::for_gfx11(&self.config, self.code.len());
+        let kd = KernelDescriptor::for_target(&self.config, self.code.len(), self.target);
         
         // Sizes
         let elf_header_size: usize = 64;
@@ -789,7 +799,7 @@ impl AmdGpuCodeObject {
             e_entry: 0,
             e_phoff: phdrs_offset as u64,
             e_shoff: shdrs_offset as u64,
-            e_flags: 0x041, // GFX1100
+            e_flags: self.target.elf_flags(),
             e_ehsize: elf_header_size as u16,
             e_phentsize: phdr_size as u16,
             e_phnum: num_phdrs as u16,
@@ -1216,9 +1226,10 @@ impl AmdGpuCodeObject {
         
         // 2. amdhsa.target (required for ROCm)
         msg.extend_from_slice(b"\xADamdhsa.target"); // key (13 chars)
-        // Value: "amdgcn-amd-amdhsa--gfx1100" (26 chars)
-        msg.extend_from_slice(b"\xBA"); // str8 with 26 chars
-        msg.extend_from_slice(b"amdgcn-amd-amdhsa--gfx1100");
+        let isa_triple = self.target.isa_triple();
+        let isa_bytes = isa_triple.as_bytes();
+        msg.push(0xA0 | isa_bytes.len() as u8);
+        msg.extend_from_slice(isa_bytes);
         
         // 3. amdhsa.version
         msg.extend_from_slice(b"\xAEamdhsa.version"); // key (14 chars)
@@ -1237,7 +1248,7 @@ impl AmdGpuCodeObject {
         let mut asm = String::new();
         
         // Header
-        asm.push_str("    .amdgcn_target \"amdgcn-amd-amdhsa--gfx1100\"\n\n");
+        asm.push_str(&format!("    .amdgcn_target \"{}\"\n\n", self.target.isa_triple()));
         
         // Text section with kernel code
         asm.push_str("    .text\n");
@@ -1292,7 +1303,7 @@ impl AmdGpuCodeObject {
         // Critical: must include amdhsa.target and .args for proper kernel dispatch
         asm.push_str("\n    .amdgpu_metadata\n");
         asm.push_str("---\n");
-        asm.push_str("amdhsa.target: amdgcn-amd-amdhsa--gfx1100\n");
+        asm.push_str(&format!("amdhsa.target: {}\n", self.target.isa_triple()));
         asm.push_str("amdhsa.version:\n");
         asm.push_str("  - 1\n");
         asm.push_str("  - 2\n");
@@ -1323,8 +1334,8 @@ impl AmdGpuCodeObject {
         asm
     }
     
-    /// Build code object using LLVM toolchain (amdclang + amdlld)
-    /// This generates a properly formatted code object that ROCm can load
+    /// Build code object using LLVM toolchain (clang + ld.lld).
+    /// This generates a properly formatted code object that the runtime can load.
     pub fn to_code_object_llvm(&self) -> Result<Vec<u8>, String> {
         use std::process::Command;
         use std::fs;
@@ -1338,55 +1349,31 @@ impl AmdGpuCodeObject {
         let asm_content = self.to_assembly();
         fs::write(&asm_path, &asm_content)
             .map_err(|e| format!("Failed to write assembly file: {}", e))?;
-        
-        // Find ROCm installation
-        let rocm_paths = [
-            "/opt/rocm-7.1.1/bin",
-            "/opt/rocm/bin",
-            "/opt/rocm/llvm/bin",
-        ];
-        
-        let rocm_bin = rocm_paths.iter()
-            .find(|p| std::path::Path::new(*p).exists())
-            .ok_or_else(|| "ROCm installation not found".to_string())?;
-        
-        // Use amdclang for assembly (more reliable than llvm-mc for AMDGPU)
-        let clang_path = format!("{}/amdclang", rocm_bin);
-        let clang_cmd = if std::path::Path::new(&clang_path).exists() {
-            clang_path
-        } else {
-            format!("{}/clang", rocm_bin)
-        };
-        
-        let mc_result = Command::new(&clang_cmd)
+
+        let clang = find_clang()?;
+        let lld = find_ld_lld()?;
+
+        let mc_result = Command::new(&clang)
             .args([
                 "-x", "assembler",
                 "-target", "amdgcn-amd-amdhsa",
-                "-mcpu=gfx1100",
+                &format!("-mcpu={}", self.target.mcpu_str()),
                 "-c",
                 &asm_path.to_string_lossy(),
                 "-o",
                 &obj_path.to_string_lossy(),
             ])
             .output()
-            .map_err(|e| format!("Failed to run amdclang: {}", e))?;
+            .map_err(|e| format!("Failed to run clang: {}", e))?;
         
         if !mc_result.status.success() {
             return Err(format!(
-                "amdclang failed: {}",
+                "clang failed: {}",
                 String::from_utf8_lossy(&mc_result.stderr)
             ));
         }
         
-        // Link with amdlld (or ld.lld)
-        let lld_path = format!("{}/amdlld", rocm_bin);
-        let lld_cmd = if std::path::Path::new(&lld_path).exists() {
-            lld_path
-        } else {
-            format!("{}/ld.lld", rocm_bin)
-        };
-        
-        let lld_result = Command::new(&lld_cmd)
+        let lld_result = Command::new(&lld)
             .args([
                 "-flavor", "gnu",
                 "-shared",
@@ -1395,11 +1382,11 @@ impl AmdGpuCodeObject {
                 &co_path.to_string_lossy(),
             ])
             .output()
-            .map_err(|e| format!("Failed to run amdlld: {}", e))?;
+            .map_err(|e| format!("Failed to run ld.lld: {}", e))?;
         
         if !lld_result.status.success() {
             return Err(format!(
-                "amdlld failed: {}",
+                "ld.lld failed: {}",
                 String::from_utf8_lossy(&lld_result.stderr)
             ));
         }

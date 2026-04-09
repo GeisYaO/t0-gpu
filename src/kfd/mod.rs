@@ -271,6 +271,10 @@ pub struct KfdDevice {
 static GLOBAL_KFD_DEVICE: std::sync::OnceLock<Arc<KfdDevice>> = std::sync::OnceLock::new();
 
 impl KfdDevice {
+    pub fn target(&self) -> crate::t0::ir::Target {
+        crate::t0::ir::Target::GFX1100
+    }
+
     /// Open the GPU device and acquire VM.
     /// Returns a cached global singleton — KFD only allows one ACQUIRE_VM per process.
     pub fn open() -> Result<Arc<Self>, String> {

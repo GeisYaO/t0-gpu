@@ -6,15 +6,15 @@
 //! - `dispatch()` / `dispatch_fused()` for convenient kernel launch
 //! - `kernargs!` macro for building kernarg byte arrays
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::sync::Arc;
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::collections::HashMap;
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::sync::Mutex;
 
-#[cfg(feature = "rocm")]
-use crate::kfd::{KfdDevice, AqlQueue, GpuBuffer, GpuKernel, KernelLoadConfig, DispatchPool};
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+use crate::gpu_backend::{GpuBuffer, GpuDevice, GpuKernel, GpuQueue, KernelLoadConfig, DispatchPool};
 
 
 // =============================================================================
@@ -26,16 +26,16 @@ use crate::kfd::{KfdDevice, AqlQueue, GpuBuffer, GpuKernel, KernelLoadConfig, Di
 // same size pops from cache (zero syscalls, same VA + mapping).
 
 /// GPU buffer pool with size-keyed caching.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub struct BufferPool {
     cache: Mutex<HashMap<usize, Vec<GpuBuffer>>>,
-    device: Arc<KfdDevice>,
+    device: Arc<GpuDevice>,
     cached_bytes: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 impl BufferPool {
-    pub fn new(device: &Arc<KfdDevice>) -> Self {
+    pub fn new(device: &Arc<GpuDevice>) -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
             device: Arc::clone(device),
@@ -82,12 +82,12 @@ impl BufferPool {
 ///
 /// Owns the device, queue, dispatch pool, and a compile cache for kernels.
 /// Shared via `Arc<GpuRuntime>` across tensors and ops.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub struct GpuRuntime {
     /// KFD device handle
-    pub device: Arc<KfdDevice>,
+    pub device: Arc<GpuDevice>,
     /// AQL hardware queue
-    pub queue: AqlQueue,
+    pub queue: GpuQueue,
     /// Dispatch pool for kernarg memory
     pub pool: DispatchPool,
     /// Buffer pool — LRU cache for VRAM buffers (eliminates VA reuse race)
@@ -105,13 +105,13 @@ pub struct GpuRuntime {
     poisoned: std::sync::atomic::AtomicBool,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 impl GpuRuntime {
     /// Create a new GpuRuntime.
     ///
     /// Opens the first KFD GPU device, creates a queue and dispatch pool.
     pub fn new() -> Result<Arc<Self>, String> {
-        let device = KfdDevice::open()?;
+        let device = GpuDevice::open()?;
         let queue = device.create_queue()?;
         let pool = DispatchPool::new(&device, 64)?; // 64 kernarg slots
 
@@ -129,7 +129,7 @@ impl GpuRuntime {
     }
 
     /// Create with a specific device.
-    pub fn with_device(device: Arc<KfdDevice>) -> Result<Arc<Self>, String> {
+    pub fn with_device(device: Arc<GpuDevice>) -> Result<Arc<Self>, String> {
         let queue = device.create_queue()?;
         let pool = DispatchPool::new(&device, 64)?;
 
@@ -167,7 +167,7 @@ impl GpuRuntime {
     /// Ensure a kernel is compiled from a T0Kernel, with automatic ELF compilation.
     ///
     /// Bridges T0 compiler output → Ignis dispatch:
-    ///   T0Kernel → .compile(GFX1100) → ELF → GpuKernel::load → cache
+    ///   T0Kernel → .compile_with_info(device target) → ELF → GpuKernel::load → cache
     pub fn ensure_kernel_t0(
         &self,
         name: &str,
@@ -180,10 +180,15 @@ impl GpuRuntime {
             return Ok(k.clone());
         }
 
-        let t0k = builder();
+        let target = self.device.target();
+        let t0k = crate::t0::ir::with_target_context(target, builder);
         let wg_actual = [t0k.wg_size(), 1, 1]; // use wg from kernel, not hardcoded
-        let elf = t0k.compile(crate::t0::ir::Target::GFX1100)?;
-        let lds = if lds_override > 0 { lds_override } else { t0k.lds_size() };
+        let (elf, final_lds) = t0k.compile_with_info(target)?;
+        let lds = if lds_override > 0 {
+            lds_override.max(final_lds)
+        } else {
+            final_lds
+        };
         let config = KernelLoadConfig {
             workgroup_size: if wg_size[0] > 0 { wg_size } else { wg_actual },
             lds_size: lds,
@@ -220,7 +225,7 @@ impl GpuRuntime {
     /// Ensure a kernel is compiled from a BlockDSL BlockKernel, with SSA compilation.
     ///
     /// Bridges T0 BlockDSL pipeline → Ignis dispatch:
-    ///   BlockKernel → compile_via_ssa(GFX1100) → ELF → GpuKernel::load → cache
+    ///   BlockKernel → compile_via_ssa(device target) → ELF → GpuKernel::load → cache
     ///
     /// This is the preferred path for new kernels (replaces ensure_kernel_t0 for non-legacy ops).
     pub fn ensure_kernel_blockdsl(
@@ -233,8 +238,9 @@ impl GpuRuntime {
             return Ok(k.clone());
         }
 
-        let kb = builder();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100)
+        let target = self.device.target();
+        let kb = crate::t0::ir::with_target_context(target, builder);
+        let ck = kb.compile_via_ssa(target)
             .map_err(|e| format!("BlockDSL compile '{}': {}", name, e))?;
 
         let config = KernelLoadConfig {
@@ -526,38 +532,12 @@ impl GpuRuntime {
 }
 
 /// Cached kernel metadata for type-safe dispatch.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 #[derive(Clone, Debug)]
 pub struct CachedKernelInfo {
     pub args: Vec<crate::t0::dsl::KernArgMeta>,
     pub kernarg_size: usize,
     pub workgroup_size: [u32; 3],
-}
-
-// ── kernargs! macro ──
-
-/// Build a kernarg byte array from typed values.
-///
-/// Usage:
-/// ```rust
-/// let ka = kernargs![
-///     input_ptr => u64,
-///     output_ptr => u64,
-///     n_elems => u32,
-///     scale => f32,
-/// ];
-/// ```
-///
-/// Supports u32, u64, f32, i32 types.
-#[macro_export]
-macro_rules! kernargs {
-    ($($val:expr => $ty:ty),* $(,)?) => {{
-        let mut _ka = Vec::new();
-        $(
-            _ka.extend_from_slice(&<$ty>::to_le_bytes($val as $ty));
-        )*
-        _ka
-    }};
 }
 
 /// Build a fixed-size kernarg byte array (stack-allocated).
@@ -582,4 +562,3 @@ macro_rules! kernargs_fixed {
         _ka
     }};
 }
-

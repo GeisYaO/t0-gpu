@@ -24,7 +24,7 @@ fn main() -> Result<(), String> {
         (1024, 1024, 4096),
     ];
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
         use std::collections::HashMap;

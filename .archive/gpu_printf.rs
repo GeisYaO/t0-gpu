@@ -22,9 +22,9 @@
 //! | 8..12  | arg1: u32                        |
 //! | 12..16 | arg2: u32                        |
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::sync::Arc;
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use crate::kfd::{GpuBuffer, KfdDevice};
 
 /// Size of printf ring buffer in bytes (64KB = 4096 messages).
@@ -38,7 +38,7 @@ const MAX_MESSAGES: u32 = (RING_BUF_SIZE as u32) / MSG_SIZE;
 
 /// GPU printf context — manages ring buffer + counter on GPU side,
 /// decodes messages on host side.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub struct GpuPrintfCtx {
     /// Ring buffer for printf messages (64KB, GPU-visible).
     ring_buf: GpuBuffer,
@@ -48,7 +48,7 @@ pub struct GpuPrintfCtx {
     formats: Vec<String>,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 impl GpuPrintfCtx {
     /// Create a new GPU printf context.
     pub fn new(device: &Arc<KfdDevice>) -> Result<Self, String> {
@@ -323,7 +323,7 @@ mod tests {
     }
 
     /// GPU integration test: dispatch a printf kernel and verify host-side decode.
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_gpu_printf_e2e() {
         use std::sync::OnceLock;
@@ -377,7 +377,7 @@ mod tests {
     }
 
     /// Test format_message (pure CPU — needs GPU only for buffer allocation).
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_format_message() {
         use crate::kfd::KfdDevice;

@@ -36,10 +36,34 @@ pub mod rdna3_asm;
 // ── Code Object (ELF) 生成器 ──
 pub mod rdna3_code_object;
 
+mod llvm_toolchain;
+
 // ── KFD 裸金属运行时 ──
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub mod kfd;
 
+// ── WSL2 DXG 运行时 ──
+#[cfg(feature = "wsl_dxg")]
+pub mod wsl_dxg;
+
+// ── Unified GPU backend interface ──
+// Provides consistent type names regardless of rocm vs wsl_dxg feature
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+pub mod gpu_backend;
+
+// ── Shared kernargs macro (used by both rocm and wsl_dxg backends) ──
+#[macro_export]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+macro_rules! kernargs {
+    ($($val:expr => $ty:ty),* $(,)?) => {{
+        let mut _ka = Vec::new();
+        $(
+            _ka.extend_from_slice(&<$ty>::to_le_bytes($val as $ty));
+        )*
+        _ka
+    }};
+}
+
 // ── Ignis — GPU-native autodiff framework ──
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub mod ignis;

@@ -18,6 +18,63 @@ pub enum BinaryOp {
     Axpy(f32),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Bf16F32WmmaShape {
+    frag_regs: u32,
+    frag_align: Alignment,
+    acc_regs: u32,
+    acc_align: Alignment,
+}
+
+impl Bf16F32WmmaShape {
+    fn current() -> Self {
+        let target = current_target();
+        let format = WmmaFormat::BF16_F32;
+        let frag_regs = format.a_vreg_count(target);
+        debug_assert_eq!(frag_regs % 4, 0, "WMMA BF16 fragment must be a multiple of 4 VGPRs");
+        Self {
+            frag_regs,
+            frag_align: format.a_alignment(target),
+            acc_regs: format.dst_vreg_count(target),
+            acc_align: format.dst_alignment(target),
+        }
+    }
+
+    fn frag_loads(self) -> u32 { self.frag_regs / 4 }
+    fn frag_bytes(self) -> u32 { self.frag_regs * 4 }
+    fn frag_span(self, groups: u32) -> u32 { self.frag_regs * groups }
+    fn acc_span(self, groups: u32) -> u32 { self.acc_regs * groups }
+}
+
+fn zero_vreg_span(k: &mut T0Kernel, base: VReg, regs: u32) {
+    for i in 0..regs {
+        k.v_mov_imm(VReg(base.0 + i), 0);
+    }
+}
+
+fn load_b128_span(k: &mut T0Kernel, dst: VReg, addr: VReg, regs: u32) {
+    debug_assert_eq!(regs % 4, 0, "B128 span load requires 4-VGPR chunks");
+    for i in 0..(regs / 4) {
+        k.global_load(VReg(dst.0 + i * 4), addr, Width::B128, (i * 16) as i32);
+    }
+}
+
+fn ds_load_bf16_fragment(
+    k: &mut T0Kernel,
+    dst: VReg,
+    vaddr: VReg,
+    regs: u32,
+    base_offset: u32,
+    row_stride_bytes: u32,
+) {
+    for i in 0..regs {
+        let off_lo = base_offset + (2 * i) * row_stride_bytes;
+        let off_hi = base_offset + (2 * i + 1) * row_stride_bytes;
+        k.ds_load_u16_d16(VReg(dst.0 + i), vaddr, off_lo as u16);
+        k.ds_load_u16_d16_hi(VReg(dst.0 + i), vaddr, off_hi as u16);
+    }
+}
+
 
 // ============================================================================
 // unpad_2d: strip padding from a 2D f32 buffer
@@ -256,6 +313,7 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     k.v_and_b32_imm(lane_id, tid, 31);
     let lane_row = k.alloc_vreg();
     k.v_and_b32_imm(lane_row, tid, 15);
+    let wmma = Bf16F32WmmaShape::current();
 
     // base_row = head_id * seq_len + chunk_id * C
     let base_row = k.alloc_sreg();
@@ -414,14 +472,13 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     k.s_cmp_ge_u32(k_task, s_total);
     k.branch_scc1("epilogue");
 
-    // Big arrays: Q fragment, K fragment, P accumulator, O accumulator
-    // WMMA needs 8-aligned
-    let q_frag = k.alloc_vreg_array(32, Alignment::Align8); // Q_slice: 4 k-groups × 8
-    let k_frag = k.alloc_vreg_array(32, Alignment::Align8); // K_tile: 4 k-groups × 8
-    let p_acc = k.alloc_vreg_array(8, Alignment::Align8);   // P^T = K @ Q^T (one tile)
-    let o_acc = k.alloc_vreg_array(32, Alignment::Align8);  // O_acc: 4 v-groups × 8
-    let p_trans = k.alloc_vreg_array(8, Alignment::Align8);  // Transposed P (A-operand)
-    let v_tile = k.alloc_vreg_array(8, Alignment::Align8);   // V tile from LDS
+    // Big arrays: 4 K-groups, 4 V-groups, target-specific BF16 fragment width.
+    let q_frag = k.alloc_vreg_array(wmma.frag_span(4), wmma.frag_align);
+    let k_frag = k.alloc_vreg_array(wmma.frag_span(4), wmma.frag_align);
+    let p_acc = k.alloc_vreg_array(wmma.acc_regs, wmma.acc_align);
+    let o_acc = k.alloc_vreg_array(wmma.acc_span(4), wmma.acc_align);
+    let p_trans = k.alloc_vreg_array(wmma.frag_regs, wmma.frag_align);
+    let v_tile = k.alloc_vreg_array(wmma.frag_regs, wmma.frag_align);
 
     k.label("main_loop");
 
@@ -466,13 +523,9 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     k.v_add_co(q_addr, q_addr, q_row_v);
     k.v_add_co_ci(VReg(q_addr.0 + 1), VReg(q_addr.0 + 1));
 
-    for i in 0..8u32 {
-        k.global_load(VReg(q_frag.0 + i * 4), q_addr, Width::B128, (i * 16) as i32);
-    }
+    load_b128_span(&mut k, q_frag, q_addr, wmma.frag_span(4));
     // Zero O_acc when r changes
-    for i in 0..32u32 {
-        k.v_mov_imm(VReg(o_acc.0 + i), 0);
-    }
+    zero_vreg_span(&mut k, o_acc, wmma.acc_span(4));
     k.wait_vmcnt(0);
     k.label("skip_q_load");
 
@@ -493,18 +546,19 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     k.v_add_co(k_addr, k_addr, k_off_v);
     k.v_add_co_ci(VReg(k_addr.0 + 1), VReg(k_addr.0 + 1));
 
-    for i in 0..8u32 {
-        k.global_load(VReg(k_frag.0 + i * 4), k_addr, Width::B128, (i * 16) as i32);
-    }
+    load_b128_span(&mut k, k_frag, k_addr, wmma.frag_span(4));
 
-    for i in 0..8u32 {
-        k.v_mov_imm(VReg(p_acc.0 + i), 0);
-    }
+    zero_vreg_span(&mut k, p_acc, wmma.acc_regs);
     k.wait_vmcnt(0);
 
     // ── WMMA: P^T = K @ Q^T (4 k-groups) ──
     for kg in 0..4u32 {
-        k.wmma_bf16_f32(p_acc, VReg(k_frag.0 + kg * 8), VReg(q_frag.0 + kg * 8), p_acc);
+        k.wmma_bf16_f32(
+            p_acc,
+            VReg(k_frag.0 + kg * wmma.frag_regs),
+            VReg(q_frag.0 + kg * wmma.frag_regs),
+            p_acc,
+        );
     }
 
     // ── Causal mask (diagonal: r == c) ──
@@ -518,7 +572,7 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     let one_f = k.alloc_vreg();
     k.v_mov_imm(one_f, 0x3F800000u32 as i32); // 1.0f32
 
-    for vk in 0..8u32 {
+    for vk in 0..wmma.acc_regs {
         // row_in_tile = 2*vk + lane_half
         let row_v = k.alloc_vreg();
         if vk == 0 {
@@ -553,7 +607,7 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     k.s_mul_i32(v_lds_base, tile_c, s2112);
 
     for vg in 0..4u32 {
-        let col_off = vg * 32;
+        let col_off = vg * wmma.frag_bytes();
         let lds_off = k.alloc_sreg();
         k.s_mov_imm(lds_off, (col_off) as i32);
         k.s_add_u32_ss(lds_off, v_lds_base, lds_off);
@@ -561,14 +615,14 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
         k.v_mov_from_sgpr(lds_addr, lds_off);
         k.v_add_u32(lds_addr, lds_read_base, lds_addr);
 
-        for vk in 0..8u32 {
-            let off_lo = (vk * 2 * 132) as u16;
-            let off_hi = ((vk * 2 + 1) * 132) as u16;
-            k.ds_load_u16_d16(VReg(v_tile.0 + vk), lds_addr, off_lo);
-            k.ds_load_u16_d16_hi(VReg(v_tile.0 + vk), lds_addr, off_hi);
-        }
+        ds_load_bf16_fragment(&mut k, v_tile, lds_addr, wmma.frag_regs, 0, 132);
         k.wait_lgkmcnt(0);
-        k.wmma_bf16_f32(VReg(o_acc.0 + vg * 8), p_trans, v_tile, VReg(o_acc.0 + vg * 8));
+        k.wmma_bf16_f32(
+            VReg(o_acc.0 + vg * wmma.acc_regs),
+            p_trans,
+            v_tile,
+            VReg(o_acc.0 + vg * wmma.acc_regs),
+        );
     }
 
     // ── Check if next task has different r → flush O_acc ──
@@ -616,9 +670,9 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     k.v_add_co_ci(VReg(o_addr.0 + 1), VReg(o_addr.0 + 1));
 
     for vg in 0..4u32 {
-        for vk in 0..8u32 {
+        for vk in 0..wmma.acc_regs {
             let off = (vk as i32) * 512 + (vg as i32) * 64;
-            k.global_atomic_add_f32(o_addr, VReg(o_acc.0 + vg * 8 + vk), off);
+            k.global_atomic_add_f32(o_addr, VReg(o_acc.0 + vg * wmma.acc_regs + vk), off);
         }
     }
     k.wait_vmcnt(0);
@@ -709,6 +763,7 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
     k.v_and_b32_imm(lane_id, tid, 31);
     let lane_row = k.alloc_vreg();
     k.v_and_b32_imm(lane_row, tid, 15);
+    let wmma = Bf16F32WmmaShape::current();
 
     let base_row = k.alloc_sreg();
     k.s_mul_i32(base_row, head_id, SReg(seq_len.0));
@@ -839,12 +894,12 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
     k.s_cmp_ge_u32(k_task, s_total);
     k.branch_scc1("epilogue");
 
-    let a_frag = k.alloc_vreg_array(32, Alignment::Align8);
-    let b_frag = k.alloc_vreg_array(32, Alignment::Align8);
-    let p_acc = k.alloc_vreg_array(8, Alignment::Align8);
-    let o_acc = k.alloc_vreg_array(32, Alignment::Align8);
-    let p_trans = k.alloc_vreg_array(8, Alignment::Align8);
-    let c_tile = k.alloc_vreg_array(8, Alignment::Align8);
+    let a_frag = k.alloc_vreg_array(wmma.frag_span(4), wmma.frag_align);
+    let b_frag = k.alloc_vreg_array(wmma.frag_span(4), wmma.frag_align);
+    let p_acc = k.alloc_vreg_array(wmma.acc_regs, wmma.acc_align);
+    let o_acc = k.alloc_vreg_array(wmma.acc_span(4), wmma.acc_align);
+    let p_trans = k.alloc_vreg_array(wmma.frag_regs, wmma.frag_align);
+    let c_tile = k.alloc_vreg_array(wmma.frag_regs, wmma.frag_align);
 
     k.label("main_loop");
 
@@ -898,12 +953,8 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
     k.v_mov_from_sgpr(VReg(a_addr.0 + 1), SReg(a_ptr.0 + 1));
     k.v_add_co(a_addr, a_addr, a_row_v);
     k.v_add_co_ci(VReg(a_addr.0 + 1), VReg(a_addr.0 + 1));
-    for i in 0..8u32 {
-        k.global_load(VReg(a_frag.0 + i * 4), a_addr, Width::B128, (i * 16) as i32);
-    }
-    for i in 0..32u32 {
-        k.v_mov_imm(VReg(o_acc.0 + i), 0);
-    }
+    load_b128_span(&mut k, a_frag, a_addr, wmma.frag_span(4));
+    zero_vreg_span(&mut k, o_acc, wmma.acc_span(4));
     k.wait_vmcnt(0);
     k.label("skip_a_load");
 
@@ -923,17 +974,18 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
     k.v_mov_from_sgpr(VReg(b_addr.0 + 1), SReg(b_ptr.0 + 1));
     k.v_add_co(b_addr, b_addr, b_off_v);
     k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-    for i in 0..8u32 {
-        k.global_load(VReg(b_frag.0 + i * 4), b_addr, Width::B128, (i * 16) as i32);
-    }
-    for i in 0..8u32 {
-        k.v_mov_imm(VReg(p_acc.0 + i), 0);
-    }
+    load_b128_span(&mut k, b_frag, b_addr, wmma.frag_span(4));
+    zero_vreg_span(&mut k, p_acc, wmma.acc_regs);
     k.wait_vmcnt(0);
 
     // ── WMMA: P^T = B @ A^T ──
     for kg in 0..4u32 {
-        k.wmma_bf16_f32(p_acc, VReg(b_frag.0 + kg * 8), VReg(a_frag.0 + kg * 8), p_acc);
+        k.wmma_bf16_f32(
+            p_acc,
+            VReg(b_frag.0 + kg * wmma.frag_regs),
+            VReg(a_frag.0 + kg * wmma.frag_regs),
+            p_acc,
+        );
     }
 
     // ── Causal mask (diagonal only: lut_r == lut_c) ──
@@ -947,7 +999,7 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
     let one_f = k.alloc_vreg();
     k.v_mov_imm(one_f, 0x3F800000u32 as i32);
 
-    for vk in 0..8u32 {
+    for vk in 0..wmma.acc_regs {
         let row_v = k.alloc_vreg();
         if vk == 0 {
             k.push(Op::VMov { dst: row_v, src: Operand::VReg(lane_half) });
@@ -981,7 +1033,7 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
     k.s_mul_i32(c_lds_base, b_tile, s2112);
 
     for vg in 0..4u32 {
-        let col_off = vg * 32;
+        let col_off = vg * wmma.frag_bytes();
         let lds_off = k.alloc_sreg();
         k.s_mov_imm(lds_off, col_off as i32);
         k.s_add_u32_ss(lds_off, c_lds_base, lds_off);
@@ -989,12 +1041,14 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
         k.v_mov_from_sgpr(lds_addr, lds_off);
         k.v_add_u32(lds_addr, lds_read_base, lds_addr);
 
-        for vk in 0..8u32 {
-            k.ds_load_u16_d16(VReg(c_tile.0 + vk), lds_addr, (vk * 2 * 132) as u16);
-            k.ds_load_u16_d16_hi(VReg(c_tile.0 + vk), lds_addr, ((vk * 2 + 1) * 132) as u16);
-        }
+        ds_load_bf16_fragment(&mut k, c_tile, lds_addr, wmma.frag_regs, 0, 132);
         k.wait_lgkmcnt(0);
-        k.wmma_bf16_f32(VReg(o_acc.0 + vg * 8), p_trans, c_tile, VReg(o_acc.0 + vg * 8));
+        k.wmma_bf16_f32(
+            VReg(o_acc.0 + vg * wmma.acc_regs),
+            p_trans,
+            c_tile,
+            VReg(o_acc.0 + vg * wmma.acc_regs),
+        );
     }
 
     // ── Flush check ──
@@ -1047,9 +1101,9 @@ fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
     k.v_add_co_ci(VReg(o_addr.0 + 1), VReg(o_addr.0 + 1));
 
     for vg in 0..4u32 {
-        for vk in 0..8u32 {
+        for vk in 0..wmma.acc_regs {
             let off = (vk as i32) * 512 + (vg as i32) * 64;
-            k.global_atomic_add_f32(o_addr, VReg(o_acc.0 + vg * 8 + vk), off);
+            k.global_atomic_add_f32(o_addr, VReg(o_acc.0 + vg * wmma.acc_regs + vk), off);
         }
     }
     k.wait_vmcnt(0);
@@ -1102,6 +1156,7 @@ pub fn ocpa_state_update() -> T0Kernel {
     k.capture_tgid_y(head_id);
 
     let tid = VReg(0); // hardware thread_id
+    let wmma = Bf16F32WmmaShape::current();
 
     // ── Pointer math: K/V base = ptr + (head_id*seq_len + chunk_id*C_chunk) * 128 ──
     let row_start = k.alloc_sreg();
@@ -1184,14 +1239,12 @@ pub fn ocpa_state_update() -> T0Kernel {
     k.v_mov_from_sgpr(hbm_step, s2048);
 
     // ── Big VGPR arrays (allocated AFTER individual VGPRs to avoid VReg(0) conflict) ──
-    let acc = k.alloc_vreg_array(128, Alignment::Align8);     // WMMA accumulators
-    let a_regs = k.alloc_vreg_array(32, Alignment::Align8);   // K^T (WMMA A)
-    let b_regs = k.alloc_vreg_array(32, Alignment::Align8);   // V   (WMMA B)
+    let acc = k.alloc_vreg_array(wmma.acc_span(16), wmma.acc_align);
+    let a_regs = k.alloc_vreg_array(wmma.frag_span(4), wmma.frag_align);
+    let b_regs = k.alloc_vreg_array(wmma.frag_span(4), wmma.frag_align);
 
     // Zero accumulators
-    for i in 0..128u32 {
-        k.v_mov_imm(VReg(acc.0 + i), 0);
-    }
+    zero_vreg_span(&mut k, acc, wmma.acc_span(16));
 
     // ════════════════════════════════════════════════════════════════
     // Main loop: process C_chunk/16 iterations
@@ -1226,34 +1279,35 @@ pub fn ocpa_state_update() -> T0Kernel {
     k.wait_lgkmcnt(0);
 
     // D. Column tearing: transpose read via ds_load_u16_d16/hi
-    // K^T → a_regs[0..31] (4 groups × 8 regs)
+    // K^T/V fragments use target-specific BF16 WMMA fragment width.
     for g in 0..4u32 {
-        for kk in 0..8u32 {
-            let off_lo = (g * 32 + 2 * kk * 132) as u16;
-            let off_hi = (g * 32 + (2 * kk + 1) * 132) as u16;
-            let v_idx = VReg(a_regs.0 + g * 8 + kk);
-            k.ds_load_u16_d16(v_idx, lds_read_base, off_lo);
-            k.ds_load_u16_d16_hi(v_idx, lds_read_base, off_hi);
-        }
+        ds_load_bf16_fragment(
+            &mut k,
+            VReg(a_regs.0 + g * wmma.frag_regs),
+            lds_read_base,
+            wmma.frag_regs,
+            g * wmma.frag_bytes(),
+            132,
+        );
     }
-    // V → b_regs[0..31] (4 groups × 8 regs)
     for v in 0..4u32 {
-        for kk in 0..8u32 {
-            let off_lo = (2112 + v * 32 + 2 * kk * 132) as u16;
-            let off_hi = (2112 + v * 32 + (2 * kk + 1) * 132) as u16;
-            let v_idx = VReg(b_regs.0 + v * 8 + kk);
-            k.ds_load_u16_d16(v_idx, lds_read_base, off_lo);
-            k.ds_load_u16_d16_hi(v_idx, lds_read_base, off_hi);
-        }
+        ds_load_bf16_fragment(
+            &mut k,
+            VReg(b_regs.0 + v * wmma.frag_regs),
+            lds_read_base,
+            wmma.frag_regs,
+            2112 + v * wmma.frag_bytes(),
+            132,
+        );
     }
     k.wait_lgkmcnt(0);
 
     // E. 16× WMMA: K^T[g] × V[v] → acc[g*4+v]
     for g in 0..4u32 {
         for v in 0..4u32 {
-            let acc_base = VReg(acc.0 + g * 32 + v * 8);
-            let a_base = VReg(a_regs.0 + g * 8);
-            let b_base = VReg(b_regs.0 + v * 8);
+            let acc_base = VReg(acc.0 + g * (4 * wmma.acc_regs) + v * wmma.acc_regs);
+            let a_base = VReg(a_regs.0 + g * wmma.frag_regs);
+            let b_base = VReg(b_regs.0 + v * wmma.frag_regs);
             k.wmma_bf16_f32(acc_base, a_base, b_base, acc_base);
         }
     }
@@ -1319,7 +1373,7 @@ pub fn ocpa_state_update() -> T0Kernel {
         k.v_lshlrev_b32(scratch_row_off, 2, scratch_row_off);
 
         for v_tile in 0..4u32 {
-            let acc_base_idx = acc.0 + k_grp * 32 + v_tile * 8;
+            let acc_base_idx = acc.0 + k_grp * (4 * wmma.acc_regs) + v_tile * wmma.acc_regs;
             let col_offset = v_tile * 16 * 4;
 
             // st_addr = w_addr + row_offset + lr_off + col_offset
@@ -1334,8 +1388,8 @@ pub fn ocpa_state_update() -> T0Kernel {
                 k.v_add_u32(st_addr, st_addr, scratch_imm);
             }
 
-            // Store 8 WMMA result rows
-            for r in 0..8u32 {
+            // Store WMMA result rows for one accumulator fragment.
+            for r in 0..wmma.acc_regs {
                 let r_offset = (r as i32) * 512;
                 k.global_store(st_addr, VReg(acc_base_idx + r), Width::B32, r_offset);
             }
@@ -1678,3 +1732,26 @@ fn t0_row_broadcast_generic(op: RowBroadcastOp) -> T0Kernel {
     k
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ocpa_forward_intra_gfx1201_wmma_operands() {
+        let kernel = with_target_context(Target::GFX1201, || ocpa_forward_intra_with_c(64));
+        let asm = kernel.to_assembly(Target::GFX1201).expect("GFX1201 OCPA forward assembly failed");
+        let wmma_line = asm.lines()
+            .find(|line| line.contains("v_wmma_f32_16x16x16_bf16"))
+            .expect("missing WMMA instruction");
+        let spans: Vec<u32> = wmma_line
+            .split("v[")
+            .skip(1)
+            .map(|part| {
+                let regs = part.split(']').next().expect("unterminated register range");
+                let (lo, hi) = regs.split_once(':').expect("expected register range");
+                hi.parse::<u32>().unwrap() - lo.parse::<u32>().unwrap() + 1
+            })
+            .collect();
+        assert_eq!(spans, vec![8, 4, 4, 8], "unexpected GFX1201 WMMA operand widths");
+    }
+}

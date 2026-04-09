@@ -784,7 +784,7 @@ pub struct TileIrTuneResult {
 /// let result = tune_tile_ir(&rt, 4096, 4096, 4096)?;
 /// eprintln!("Best: {} ({:.1} TF)", result.best.name(), result.best_tflops);
 /// ```
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub fn tune_tile_ir(
     rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
     m: u32, n: u32, k: u32,
@@ -862,7 +862,7 @@ pub fn tune_tile_ir(
     // Fix: keep ALL kernels alive until the entire tune session completes. This matches
     // the pattern used by ensure_kernel_t0 (HashMap cache), which never drops code_bufs
     // and never hangs when switching between kernel configs.
-    use crate::kfd::{GpuKernel, KernelLoadConfig};
+    use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
 
     struct CompiledCandidate {
         spec: super::tile_ir::TileGemm,
@@ -1266,7 +1266,7 @@ mod tests {
 
     /// GPU E2E: tune tile_ir for 4096³ GEMM
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[ignore] // Run explicitly: cargo test --release --features rocm -- test_tune_tile_ir_4096 --ignored --nocapture
     fn test_tune_tile_ir_4096() {
         let rt = crate::ignis::gpu_context::GpuRuntime::new()
@@ -1304,7 +1304,7 @@ mod tests {
 
     /// GPU E2E: tune tile_ir for 9 standard sizes
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[ignore]
     fn test_tune_tile_ir_all_sizes() {
         let rt = crate::ignis::gpu_context::GpuRuntime::new()

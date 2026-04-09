@@ -7,7 +7,7 @@
 //!
 //! Reports: max absolute error, mean absolute error, relative error, PASS/FAIL
 
-use t0_gpu::t0::{GFX1100Schedule, Schedule, Target};
+use t0_gpu::t0::Target;
 use t0_gpu::t0::gemm_gen::{GemmConfig, generate, compute_grid, compute_grid_split_k};
 
 // ── bf16 helpers ──
@@ -96,7 +96,7 @@ fn main() -> Result<(), String> {
         compiled.push(elf);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 

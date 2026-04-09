@@ -5,7 +5,7 @@
 //!   2. 用 KFD 直接与 GPU 通信（无 HIP / ROCm 运行时）
 //!   3. 分配 VRAM、上传数据、dispatch、读回结果、验证
 
-use t0_gpu::t0::{T0Kernel, Target, GFX1100Schedule, Schedule};
+use t0_gpu::t0::{Target, GFX1100Schedule, Schedule};
 use t0_gpu::t0::math;
 
 fn main() -> Result<(), String> {
@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     eprintln!("  ✓ Compiled 'vector_add' kernel: {} bytes ELF", elf.len());
 
     // ── Step 2: Open KFD device ──
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
         use std::sync::Arc;

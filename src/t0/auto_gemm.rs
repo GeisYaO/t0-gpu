@@ -78,7 +78,7 @@ impl GemmTuner {
     /// Returns the best GemmConfig based on actual GPU measurements.
     /// First call benchmarks `max_candidates` configs (~2-5s).
     /// Subsequent calls return from cache (~0ns).
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     pub fn tune(
         &mut self,
         rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
@@ -165,14 +165,14 @@ impl GemmTuner {
     ///
     /// Compiles the kernel, allocates random bf16 data, dispatches
     /// `n_iters` times, and returns median TFLOPS.
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn benchmark_one(
         &self,
         rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
         cfg: &GemmConfig,
         m: u32, n: u32, k: u32,
     ) -> Result<f64, String> {
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
 
         // 1. Generate and compile kernel
         let kernel_ir = super::gemm_gen::generate(cfg);
@@ -238,14 +238,14 @@ impl GemmTuner {
     }
 
     /// Benchmark a single TileGemm (tile_ir path) on the GPU.
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn benchmark_tile_ir(
         &self,
         rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
         spec: &super::tile_ir::TileGemm,
         m: u32, n: u32, k: u32,
     ) -> Result<f64, String> {
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
 
         // Safety: reject configs with LDS > 64KB (CWSR hang on GFX1100)
         let lds_total = spec.lds_total();
@@ -418,14 +418,14 @@ impl GemmTuner {
 
 // ── Global tuner (lazy singleton) ──
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::sync::Mutex;
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 static GLOBAL_TUNER: std::sync::OnceLock<Mutex<GemmTuner>> = std::sync::OnceLock::new();
 
 /// Get or create the global GEMM tuner.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub fn global_tuner() -> &'static Mutex<GemmTuner> {
     GLOBAL_TUNER.get_or_init(|| Mutex::new(GemmTuner::new()))
 }
@@ -441,12 +441,12 @@ pub fn global_tuner() -> &'static Mutex<GemmTuner> {
 /// # use std::sync::Arc;
 /// auto_gemm(&rt, &a_buf, &b_buf, &c_buf, 4096, 4096, 4096).unwrap();
 /// ```
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub fn auto_gemm(
     rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
-    a_buf: &crate::kfd::GpuBuffer,
-    b_buf: &crate::kfd::GpuBuffer,
-    c_buf: &crate::kfd::GpuBuffer,
+    a_buf: &crate::gpu_backend::GpuBuffer,
+    b_buf: &crate::gpu_backend::GpuBuffer,
+    c_buf: &crate::gpu_backend::GpuBuffer,
     m: u32, n: u32, k: u32,
 ) -> Result<f64, String> {
     // 1. Tune (or cache hit)
@@ -542,7 +542,7 @@ mod tests {
 
     /// GPU E2E: tune 4096³ GEMM and verify TFLOPS > 50
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_tune_4096() {
         let rt = crate::ignis::gpu_context::GpuRuntime::new()
             .expect("GpuRuntime::new");

@@ -35,7 +35,7 @@ pub struct TuneResult {
 
 /// PGO cache entry stored as JSON.
 #[derive(Clone, Debug)]
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 struct CacheEntry {
     kernel_name: String,
     best_wg_size: u32,
@@ -45,13 +45,13 @@ struct CacheEntry {
 }
 
 /// Profile-guided tuner for kernel configurations.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub struct ProfileTuner {
     cache_dir: PathBuf,
     cache: HashMap<String, TuneResult>,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 impl ProfileTuner {
     /// Create a new profiler with default cache directory.
     pub fn new() -> Self {
@@ -334,7 +334,7 @@ mod tests {
         let dir = PathBuf::from("/tmp/t0_pgo_test_cache");
         let _ = std::fs::remove_dir_all(&dir);
 
-        #[cfg(feature = "rocm")]
+        #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
         {
             let mut tuner = ProfileTuner::with_cache_dir(dir.clone());
             let result = TuneResult {

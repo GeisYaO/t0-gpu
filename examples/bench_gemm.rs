@@ -11,7 +11,7 @@
 //! ## WMMA tile
 //! 32×64 output tile, K_tile=16, workgroup = 64 threads (2 waves)
 
-use t0_gpu::t0::{GFX1100Schedule, Schedule, Target};
+use t0_gpu::t0::Target;
 use t0_gpu::t0::math;
 
 fn main() -> Result<(), String> {
@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
     let elf = kernel_ir.compile(Target::GFX1100)?;
     eprintln!("  ✓ {} bytes ELF", elf.len());
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 

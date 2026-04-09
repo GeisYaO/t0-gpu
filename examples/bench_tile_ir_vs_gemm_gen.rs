@@ -77,7 +77,7 @@ fn main() -> Result<(), String> {
         }));
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 

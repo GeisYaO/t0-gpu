@@ -18,7 +18,7 @@ fn main() -> Result<(), String> {
     eprintln!("║  Peak: 123 TFLOPS (bf16 WMMA)                             ║");
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::ignis::gpu_context::GpuRuntime;
         use std::sync::Arc;

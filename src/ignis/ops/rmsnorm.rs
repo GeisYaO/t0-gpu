@@ -9,7 +9,7 @@
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
-use crate::kfd::{GpuBuffer, KfdDevice};
+use crate::gpu_backend::{GpuBuffer, GpuDevice};
 #[cfg(feature = "rocm")]
 use super::super::tensor::Tensor;
 #[cfg(feature = "rocm")]
@@ -23,7 +23,7 @@ const EPSILON: f32 = 1e-5;
 /// - gamma: [dim] f32 (per-channel scale)
 /// - output: [rows, dim] f32
 #[cfg(feature = "rocm")]
-pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn rmsnorm(x: &Tensor, gamma: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let runtime = x.runtime().clone();
     let shape = x.shape().to_vec();
     assert!(shape.len() >= 1, "rmsnorm: need at least 1D");

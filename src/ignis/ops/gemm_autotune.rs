@@ -3,7 +3,7 @@
 //! Wraps T0's `auto_select()` to pick the best kernel config per matrix size.
 
 #[cfg(feature = "rocm")]
-use crate::kfd::GpuKernel;
+use crate::gpu_backend::GpuKernel;
 #[cfg(feature = "rocm")]
 use super::super::gpu_context::GpuRuntime;
 #[cfg(feature = "rocm")]

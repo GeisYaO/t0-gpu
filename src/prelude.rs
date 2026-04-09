@@ -12,9 +12,8 @@ pub use crate::t0::dsl::{DType, CompiledKernel, KernArgMeta, KernArgType};
 pub use crate::t0::ir::Target;
 pub use crate::t0::gemm_gen::{GemmConfig, auto_select, compute_grid_auto, build_kernargs};
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub use crate::ignis::gpu_context::GpuRuntime;
-#[cfg(feature = "rocm")]
-pub use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool, GpuBuffer};
-
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+pub use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool, GpuBuffer};
 

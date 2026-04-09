@@ -8,7 +8,7 @@
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
-use crate::kfd::{GpuBuffer, KfdDevice};
+use crate::gpu_backend::{GpuBuffer, GpuDevice};
 #[cfg(feature = "rocm")]
 use super::super::tensor::{Tensor, DType};
 #[cfg(feature = "rocm")]
@@ -23,7 +23,7 @@ use super::super::gpu_context::GpuRuntime;
 /// Forward: output[i] = a[i] + b[i]
 /// Backward: da = grad_out, db = grad_out (gradient passes through unchanged)
 #[cfg(feature = "rocm")]
-pub fn add(a: &Tensor, b: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn add(a: &Tensor, b: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     assert_eq!(a.shape(), b.shape(), "add: shape mismatch {:?} vs {:?}", a.shape(), b.shape());
     let n = a.numel();
     let runtime = a.runtime().clone();
@@ -127,7 +127,7 @@ pub fn add(a: &Tensor, b: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, S
 /// Forward: GPU via DSL `Op::Scale`
 /// Backward: da = grad_out * scalar (CPU)
 #[cfg(feature = "rocm")]
-pub fn scale(a: &Tensor, scalar: f32, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn scale(a: &Tensor, scalar: f32, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let n = a.numel();
     let runtime = a.runtime().clone();
 
@@ -209,7 +209,7 @@ pub fn scale(a: &Tensor, scalar: f32, _device: &Arc<KfdDevice>) -> Result<Tensor
 /// Forward: output = sum(a[i])  (GPU reduction kernel)
 /// Backward: da[i] = grad_out (broadcast scalar to all elements)
 #[cfg(feature = "rocm")]
-pub fn sum(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn sum(a: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let n = a.numel();
     let runtime = a.runtime().clone();
 
@@ -311,7 +311,7 @@ pub fn sum(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
 ///
 /// Backward: da = grad_out * b, db = grad_out * a
 #[cfg(feature = "rocm")]
-pub fn elementwise_mul(a: &Tensor, b: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn elementwise_mul(a: &Tensor, b: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     assert_eq!(a.shape(), b.shape(), "mul: shape mismatch {:?} vs {:?}", a.shape(), b.shape());
     let n = a.numel();
     let runtime = a.runtime().clone();

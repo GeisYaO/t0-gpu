@@ -48,7 +48,7 @@ fn main() -> Result<(), String> {
         kernels_info.push((cfg, elf));
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
