@@ -6,15 +6,15 @@
 //! - `dispatch()` / `dispatch_fused()` for convenient kernel launch
 //! - `kernargs!` macro for building kernarg byte arrays
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::sync::Arc;
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::collections::HashMap;
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::sync::Mutex;
 
-#[cfg(feature = "rocm")]
-use crate::kfd::{KfdDevice, AqlQueue, GpuBuffer, GpuKernel, KernelLoadConfig, DispatchPool};
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+use crate::gpu_backend::{GpuBuffer, GpuDevice, GpuKernel, GpuQueue, KernelLoadConfig, DispatchPool};
 
 
 // =============================================================================
@@ -26,16 +26,16 @@ use crate::kfd::{KfdDevice, AqlQueue, GpuBuffer, GpuKernel, KernelLoadConfig, Di
 // same size pops from cache (zero syscalls, same VA + mapping).
 
 /// GPU buffer pool with size-keyed caching.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub struct BufferPool {
     cache: Mutex<HashMap<usize, Vec<GpuBuffer>>>,
-    device: Arc<KfdDevice>,
+    device: Arc<GpuDevice>,
     cached_bytes: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 impl BufferPool {
-    pub fn new(device: &Arc<KfdDevice>) -> Self {
+    pub fn new(device: &Arc<GpuDevice>) -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
             device: Arc::clone(device),
@@ -82,12 +82,12 @@ impl BufferPool {
 ///
 /// Owns the device, queue, dispatch pool, and a compile cache for kernels.
 /// Shared via `Arc<GpuRuntime>` across tensors and ops.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub struct GpuRuntime {
     /// KFD device handle
-    pub device: Arc<KfdDevice>,
+    pub device: Arc<GpuDevice>,
     /// AQL hardware queue
-    pub queue: AqlQueue,
+    pub queue: GpuQueue,
     /// Dispatch pool for kernarg memory
     pub pool: DispatchPool,
     /// Buffer pool — LRU cache for VRAM buffers (eliminates VA reuse race)
@@ -103,15 +103,17 @@ pub struct GpuRuntime {
     /// Queue poisoned flag: set after GPU timeout/reset to prevent further dispatches
     /// that would cause cascading hangs on the already-corrupted queue.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Serializes reuse of the shared completion signal in `DispatchPool`.
+    precise_dispatch_lock: Mutex<()>,
 }
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 impl GpuRuntime {
     /// Create a new GpuRuntime.
     ///
     /// Opens the first KFD GPU device, creates a queue and dispatch pool.
     pub fn new() -> Result<Arc<Self>, String> {
-        let device = KfdDevice::open()?;
+        let device = GpuDevice::open()?;
         let queue = device.create_queue()?;
         let pool = DispatchPool::new(&device, 64)?; // 64 kernarg slots
 
@@ -125,11 +127,12 @@ impl GpuRuntime {
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            precise_dispatch_lock: Mutex::new(()),
         }))
     }
 
     /// Create with a specific device.
-    pub fn with_device(device: Arc<KfdDevice>) -> Result<Arc<Self>, String> {
+    pub fn with_device(device: Arc<GpuDevice>) -> Result<Arc<Self>, String> {
         let queue = device.create_queue()?;
         let pool = DispatchPool::new(&device, 64)?;
 
@@ -143,6 +146,7 @@ impl GpuRuntime {
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            precise_dispatch_lock: Mutex::new(()),
         }))
     }
 
@@ -167,7 +171,7 @@ impl GpuRuntime {
     /// Ensure a kernel is compiled from a T0Kernel, with automatic ELF compilation.
     ///
     /// Bridges T0 compiler output → Ignis dispatch:
-    ///   T0Kernel → .compile(GFX1100) → ELF → GpuKernel::load → cache
+    ///   T0Kernel → .compile_with_info(device target) → ELF → GpuKernel::load → cache
     pub fn ensure_kernel_t0(
         &self,
         name: &str,
@@ -180,10 +184,15 @@ impl GpuRuntime {
             return Ok(k.clone());
         }
 
-        let t0k = builder();
+        let target = self.device.target();
+        let t0k = crate::t0::ir::with_target_context(target, builder);
         let wg_actual = [t0k.wg_size(), 1, 1]; // use wg from kernel, not hardcoded
-        let elf = t0k.compile(crate::t0::ir::Target::GFX1100)?;
-        let lds = if lds_override > 0 { lds_override } else { t0k.lds_size() };
+        let (elf, final_lds) = t0k.compile_with_info(target)?;
+        let lds = if lds_override > 0 {
+            lds_override.max(final_lds)
+        } else {
+            final_lds
+        };
         let config = KernelLoadConfig {
             workgroup_size: if wg_size[0] > 0 { wg_size } else { wg_actual },
             lds_size: lds,
@@ -220,7 +229,7 @@ impl GpuRuntime {
     /// Ensure a kernel is compiled from a BlockDSL BlockKernel, with SSA compilation.
     ///
     /// Bridges T0 BlockDSL pipeline → Ignis dispatch:
-    ///   BlockKernel → compile_via_ssa(GFX1100) → ELF → GpuKernel::load → cache
+    ///   BlockKernel → compile_via_ssa(device target) → ELF → GpuKernel::load → cache
     ///
     /// This is the preferred path for new kernels (replaces ensure_kernel_t0 for non-legacy ops).
     pub fn ensure_kernel_blockdsl(
@@ -233,8 +242,9 @@ impl GpuRuntime {
             return Ok(k.clone());
         }
 
-        let kb = builder();
-        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100)
+        let target = self.device.target();
+        let kb = crate::t0::ir::with_target_context(target, builder);
+        let ck = kb.compile_via_ssa(target)
             .map_err(|e| format!("BlockDSL compile '{}': {}", name, e))?;
 
         let config = KernelLoadConfig {
@@ -257,6 +267,17 @@ impl GpuRuntime {
         slot
     }
 
+    #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+    fn dump_asm_only_mode(&self) -> bool {
+        std::env::var("T0_DUMP_ASM").is_ok()
+            && matches!(self.device.target(), crate::t0::ir::Target::GFX1201)
+    }
+
+    #[cfg(not(all(feature = "wsl_dxg", not(feature = "rocm"))))]
+    fn dump_asm_only_mode(&self) -> bool {
+        false
+    }
+
     /// Dispatch a kernel with the given grid size and kernarg data.
     ///
     /// This is a synchronous dispatch: writes kernargs, submits, waits.
@@ -267,6 +288,11 @@ impl GpuRuntime {
         grid: [u32; 3],
         kernargs: &[u8],
     ) -> Result<(), String> {
+        if self.dump_asm_only_mode() {
+            return Err(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: compile/ASM dump is enabled and GPU dispatch is intentionally blocked".into()
+            );
+        }
         if self.is_poisoned() {
             return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
         }
@@ -278,13 +304,174 @@ impl GpuRuntime {
             Self::validate_kernarg_pointers(kernargs);
         }
 
+        #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+        {
+            return self.dispatch_precise(kernel, grid, kernargs);
+        }
+
+        #[cfg(not(all(feature = "wsl_dxg", not(feature = "rocm"))))]
+        {
+            let slot = self.next_slot();
+            let ka_buf = self.pool.write_kernargs(slot, kernargs);
+            self.queue.submit(kernel, grid, ka_buf);
+            self.queue.wait_idle().map_err(|e| {
+                self.mark_poisoned();
+                e
+            })
+        }
+    }
+
+    /// Dispatch a kernel and wait for real completion via the reusable signal.
+    ///
+    /// Unlike `wait_idle()`, this is safe for backends whose queue read pointer
+    /// can advance before the kernel has actually retired.
+    pub fn dispatch_precise(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &[u8],
+    ) -> Result<(), String> {
+        self.dispatch_batch_precise(kernel, grid, kernargs, 1)
+    }
+
+    /// Submit a batch of identical dispatches and wait for the final one with a
+    /// completion signal. This preserves FIFO throughput benchmarking while
+    /// still measuring true GPU completion.
+    pub fn dispatch_batch_precise(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &[u8],
+        n_iters: usize,
+    ) -> Result<(), String> {
+        if self.dump_asm_only_mode() {
+            return Err(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: compile/ASM dump is enabled and GPU dispatch is intentionally blocked".into()
+            );
+        }
+        if self.is_poisoned() {
+            return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
+        }
+        if n_iters == 0 {
+            return Ok(());
+        }
+
+        if std::env::var("T0_VALIDATE_KA").is_ok() {
+            Self::validate_kernarg_pointers(kernargs);
+        }
+
+        let _signal_guard = self.precise_dispatch_lock.lock().unwrap();
+
+        for _ in 0..(n_iters - 1) {
+            let slot = self.next_slot();
+            let ka_buf = self.pool.write_kernargs(slot, kernargs);
+            self.queue.submit(kernel, grid, ka_buf);
+        }
+
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
-        self.queue.submit(kernel, grid, ka_buf);
-        self.queue.wait_idle().map_err(|e| {
-            self.mark_poisoned();
-            e
-        })
+        self.queue
+            .dispatch_signal(kernel, grid, ka_buf, Some(&self.pool.signal))
+            .map_err(|e| {
+                self.mark_poisoned();
+                e
+            })
+    }
+
+    #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+    pub fn dispatch_batch_profiled_gpu_us(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &[u8],
+        n_iters: usize,
+    ) -> Result<f64, String> {
+        if self.dump_asm_only_mode() {
+            return Err(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: compile/ASM dump is enabled and GPU dispatch is intentionally blocked".into()
+            );
+        }
+        if self.is_poisoned() {
+            return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
+        }
+        if n_iters == 0 {
+            return Ok(0.0);
+        }
+
+        if std::env::var("T0_VALIDATE_KA").is_ok() {
+            Self::validate_kernarg_pointers(kernargs);
+        }
+
+        let _signal_guard = self.precise_dispatch_lock.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut gpu_tick_deltas: Vec<u64> = Vec::with_capacity(n_iters);
+
+        for _ in 0..n_iters {
+            let slot = self.next_slot();
+            let ka_buf = self.pool.write_kernargs(slot, kernargs);
+            let (start_ts, end_ts) = self.queue
+                .dispatch_signal_profiled(kernel, grid, ka_buf, &self.pool.signal)
+                .map_err(|e| {
+                    self.mark_poisoned();
+                    e
+                })?;
+            if end_ts < start_ts {
+                return Err(format!(
+                    "DXG GPU timestamp chain invalid: end_ts({}) < start_ts({})",
+                    end_ts, start_ts
+                ));
+            }
+            gpu_tick_deltas.push(end_ts - start_ts);
+        }
+
+        // Keep wall-clock for diagnostics only.
+        let wall_avg_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        if gpu_tick_deltas.is_empty() {
+            return Err("DXG GPU timestamp chain empty: no profiling ticks captured".to_string());
+        }
+        let mut sorted = gpu_tick_deltas.clone();
+        sorted.sort_unstable();
+        let min_tick = sorted[0];
+        let med_tick = sorted[sorted.len() / 2];
+        let max_tick = *sorted.last().unwrap();
+        let sum_ticks: u128 = gpu_tick_deltas.iter().map(|&v| v as u128).sum();
+        let avg_tick = sum_ticks as f64 / gpu_tick_deltas.len() as f64;
+
+        // Align with librocdxg conversion path:
+        // elapsed ticks are converted by adapter-reported gpu_counter_frequency.
+        let freq_hz = self.device.gpu_counter_frequency_hz()?;
+
+        let gpu_avg_us = avg_tick * 1_000_000.0 / freq_hz as f64;
+        let ratio = if wall_avg_us > 0.0 { gpu_avg_us / wall_avg_us } else { 0.0 };
+        let unreliable = ratio < 0.5 || ratio > 2.0;
+        let calib_info = match self.device.query_clock_calibration() {
+            Ok(calib) => format!(
+                "calib[gpu_freq={},gpu_counter={},cpu_counter={}]",
+                calib.gpu_frequency_hz, calib.gpu_clock_counter, calib.cpu_clock_counter
+            ),
+            Err(err) => format!("calib[error={}]", err),
+        };
+        if matches!(
+            std::env::var("T0_DXG_DEBUG").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        ) {
+            eprintln!(
+                "[DXG PROFILE] n={} wall_avg_us={:.3} gpu_avg_us={:.3} ratio={:.3} unreliable={} freq_hz={} tick[min/med/max]={}/{}/{} {}",
+                n_iters,
+                wall_avg_us,
+                gpu_avg_us,
+                ratio,
+                unreliable,
+                freq_hz,
+                min_tick,
+                med_tick,
+                max_tick,
+                calib_info,
+            );
+        }
+
+        Ok(gpu_avg_us)
     }
 
     /// Benchmark-optimized dispatch: AGENT fence scope + spin-wait.
@@ -300,6 +487,12 @@ impl GpuRuntime {
         grid: [u32; 3],
         kernargs: &[u8],
     ) {
+        if self.dump_asm_only_mode() {
+            eprintln!(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: skip dispatch_bench (ASM dump only mode)"
+            );
+            return;
+        }
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
         self.queue.submit_fast(kernel, grid, ka_buf);
@@ -335,6 +528,12 @@ impl GpuRuntime {
         grid: [u32; 3],
         kernargs: &[u8],
     ) -> usize {
+        if self.dump_asm_only_mode() {
+            eprintln!(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: skip dispatch_async (ASM dump only mode)"
+            );
+            return usize::MAX;
+        }
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
         self.queue.submit(kernel, grid, ka_buf);
@@ -526,38 +725,12 @@ impl GpuRuntime {
 }
 
 /// Cached kernel metadata for type-safe dispatch.
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 #[derive(Clone, Debug)]
 pub struct CachedKernelInfo {
     pub args: Vec<crate::t0::dsl::KernArgMeta>,
     pub kernarg_size: usize,
     pub workgroup_size: [u32; 3],
-}
-
-// ── kernargs! macro ──
-
-/// Build a kernarg byte array from typed values.
-///
-/// Usage:
-/// ```rust
-/// let ka = kernargs![
-///     input_ptr => u64,
-///     output_ptr => u64,
-///     n_elems => u32,
-///     scale => f32,
-/// ];
-/// ```
-///
-/// Supports u32, u64, f32, i32 types.
-#[macro_export]
-macro_rules! kernargs {
-    ($($val:expr => $ty:ty),* $(,)?) => {{
-        let mut _ka = Vec::new();
-        $(
-            _ka.extend_from_slice(&<$ty>::to_le_bytes($val as $ty));
-        )*
-        _ka
-    }};
 }
 
 /// Build a fixed-size kernarg byte array (stack-allocated).
@@ -582,4 +755,3 @@ macro_rules! kernargs_fixed {
         _ka
     }};
 }
-

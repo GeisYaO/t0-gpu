@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "rocm")]
-use crate::kfd::{GpuBuffer, KfdDevice};
+use crate::gpu_backend::{GpuBuffer, GpuDevice};
 #[cfg(feature = "rocm")]
 use super::gpu_context::GpuRuntime;
 
@@ -172,7 +172,7 @@ impl Tensor {
     }
 
     /// Get device reference (convenience, delegates to runtime).
-    pub fn device(&self) -> &Arc<KfdDevice> {
+    pub fn device(&self) -> &Arc<GpuDevice> {
         &self.runtime.device
     }
 
@@ -240,7 +240,7 @@ impl Tensor {
     pub fn accumulate_grad(
         &self,
         incoming: &Arc<GpuBuffer>,
-        _device: &Arc<KfdDevice>,
+        _device: &Arc<GpuDevice>,
     ) -> Result<(), String> {
         let mut grad_ref = self.grad.borrow_mut();
         let n = self.numel();

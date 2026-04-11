@@ -6,7 +6,7 @@
 //!
 //! Run: cargo run --example test_gemm_backward --features rocm --release
 
-use t0_gpu::t0::{GFX1100Schedule, Schedule, Target};
+use t0_gpu::t0::Target;
 use t0_gpu::t0::gemm_gen::{
     generate, auto_select_backward_data, auto_select_backward_weight,
     build_kernargs_backward_data, build_kernargs_backward_weight,
@@ -125,7 +125,7 @@ fn main() -> Result<(), String> {
         (512, 256, 128),
     ];
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 

@@ -1,7 +1,7 @@
-//! GFX1100 Cost Model for Auto-Scheduling
+//! GPU Cost Model for Auto-Scheduling
 //!
-//! Models hardware constraints of AMD RX 7900 XTX (RDNA3, GFX1100)
-//! and provides cost estimation for GEMM tile parameter selection.
+//! Models target-specific hardware constraints and provides
+//! cost estimation for GEMM tile parameter selection.
 //!
 //! # Usage
 //! ```rust
@@ -9,13 +9,17 @@
 //! // Returns optimal tile_m, tile_n, tile_k, workgroup_size
 //! ```
 
+use super::ir::{current_target, with_target_context, Target, WmmaFormat};
+
 // ============================================================================
-// GFX1100 Hardware Limits
+// Hardware Limits
 // ============================================================================
 
-/// Hardware specifications for GFX1100 (Navi 31, RDNA3).
+/// Target-specific hardware/spec-model limits used by the GEMM cost model.
 #[derive(Clone, Debug)]
-pub struct GFX1100Limits {
+pub struct GpuHwLimits {
+    /// GPU target architecture this limit set models.
+    pub target: Target,
     /// VGPRs per SIMD unit (Wave32 mode)
     pub max_vgprs: u32,
     /// SGPRs per wavefront  
@@ -46,25 +50,55 @@ pub struct GFX1100Limits {
     pub simds_per_cu: u32,
     /// L2 cache size in bytes (RX 7900 XTX = 6 MB)
     pub l2_cache_bytes: u64,
+    /// Peak matrix throughput ceiling used by the roofline score.
+    pub peak_matrix_tflops: f64,
 }
 
-impl Default for GFX1100Limits {
+impl Default for GpuHwLimits {
     fn default() -> Self {
-        GFX1100Limits {
-            max_vgprs: 256,
-            max_sgprs: 106,
-            lds_per_wg: 65536,    // 64 KB
-            lds_per_cu: 131072,   // 128 KB (shared across WGP in WGP mode)
-            n_cus: 96,
-            wmma_cycles: 4,       // probe-calibrated: ~36 shader cycles ≈ 3.4→4 VALU-norm
-            wmma_mn: 16,
-            wmma_k: 16,
-            vmem_bandwidth_gbps: 960.0,
-            lds_bandwidth_gbps: 3700.0,
-            clock_ghz: 2.5,
-            wgp_mode: true,       // enable WGP mode by default on GFX1100
-            simds_per_cu: 2,
-            l2_cache_bytes: 6 * 1024 * 1024, // 6 MB L2 on RX 7900 XTX
+        Self::for_target(Target::GFX1100)
+    }
+}
+
+impl GpuHwLimits {
+    pub fn for_target(target: Target) -> Self {
+        match target {
+            Target::GFX1100 => Self {
+                target,
+                max_vgprs: 256,
+                max_sgprs: 106,
+                lds_per_wg: 65536,    // 64 KB
+                lds_per_cu: 131072,   // 128 KB (shared across WGP in WGP mode)
+                n_cus: 96,
+                wmma_cycles: 4,       // probe-calibrated: ~36 shader cycles ≈ 3.4→4 VALU-norm
+                wmma_mn: 16,
+                wmma_k: 16,
+                vmem_bandwidth_gbps: 960.0,
+                lds_bandwidth_gbps: 3700.0,
+                clock_ghz: 2.5,
+                wgp_mode: true,
+                simds_per_cu: 2,
+                l2_cache_bytes: 6 * 1024 * 1024,
+                peak_matrix_tflops: 123.0,
+            },
+            Target::GFX1201 => Self {
+                target,
+                max_vgprs: 256,
+                max_sgprs: 106,
+                lds_per_wg: 65536,
+                lds_per_cu: 65536,
+                n_cus: 56,
+                wmma_cycles: 4,
+                wmma_mn: 16,
+                wmma_k: 16,
+                vmem_bandwidth_gbps: 640.0,
+                lds_bandwidth_gbps: 3700.0,
+                clock_ghz: 2.52,
+                wgp_mode: false,
+                simds_per_cu: 2,
+                l2_cache_bytes: 64 * 1024 * 1024,
+                peak_matrix_tflops: 145.0,
+            },
         }
     }
 }
@@ -164,26 +198,31 @@ pub struct TileCost {
 // Cost estimation
 // ============================================================================
 
-/// Estimate cost for a given tile configuration on GFX1100.
+/// Estimate cost for a given tile configuration on the selected GPU target.
 pub fn estimate_tile_cost(
     config: &TileConfig,
     m: u32, n: u32, k: u32,
     fmt: DataFormat,
-    hw: &GFX1100Limits,
+    hw: &GpuHwLimits,
 ) -> TileCost {
     let tile_m = config.tile_m;
     let tile_n = config.tile_n;
     let tile_k = config.tile_k;
 
     // ── VGPR estimation ──
-    // Accumulators: n_wmma_tiles × m_wmma_per_wave × 8 VGPRs (f32 accumulator)
+    let wmma = WmmaFormat::BF16_F32;
+    let acc_regs_per_tile = wmma.dst_vreg_count(hw.target);
+    let a_regs_per_frag = wmma.a_vreg_count(hw.target);
+    let b_regs_per_frag = wmma.b_vreg_count(hw.target);
+
+    // Accumulators: n_wmma_tiles × m_wmma_per_wave × target-specific f32 accumulator VGPRs
     let n_wmma = config.n_wmma_tiles();
     let m_wmma = config.m_wmma_per_wave();
-    let acc_vgprs = n_wmma * m_wmma * 8;
+    let acc_vgprs = n_wmma * m_wmma * acc_regs_per_tile;
 
-    // Fragments: A fragment (8 VGPRs) + B fragments (n_wmma × 8 VGPRs)
-    let frag_a_vgprs = m_wmma * 8;
-    let frag_b_vgprs = n_wmma * 8;
+    // Fragments: target-specific WMMA operand footprint (GFX12 A/B are 4 VGPR each)
+    let frag_a_vgprs = m_wmma * a_regs_per_frag;
+    let frag_b_vgprs = n_wmma * b_regs_per_frag;
 
     // Address registers: ~6 (x_base, wt_base, k_byte_off, etc.)
     let addr_vgprs = 6u32;
@@ -264,7 +303,7 @@ pub fn estimate_tile_cost(
     let compute_cycles_per_wg: u32;
     
     // Use a thread-local cache to avoid regenerating kernels for the same config
-    let kloop = analyze_kloop(config);
+    let kloop = analyze_kloop_for_target(hw.target, config);
     
     if let Some(ref analysis) = kloop {
         // Instruction-level model: use refined cycles from actual K-loop analysis.
@@ -345,7 +384,7 @@ pub fn estimate_tile_cost(
     // 96 CUs × 2 SIMDs × 1 WMMA per 4 cycles × 8192 FLOPs per WMMA × 2.5 GHz / 1e12
     // = 96 × 2 × 2.5e9 / 4 × 8192 / 1e12 ≈ 98.3 TFLOPS theoretical
     // Published peak: 123 TFLOPS (AMD spec)
-    let peak_tflops = 123.0;
+    let peak_tflops = hw.peak_matrix_tflops;
     
     // Also account for compute time from K-loop analysis
     let compute_tflops = if compute_time_cycles > 0.0 {
@@ -406,17 +445,19 @@ pub fn estimate_tile_cost(
 /// - swap_grid ∈ {false, true}
 ///
 /// Returns ordered list of feasible configs, best first.
-pub fn auto_schedule_gemm(
+pub fn auto_schedule_gemm_for_target(
+    target: Target,
     m: u32, n: u32, k: u32,
     fmt: DataFormat,
 ) -> Vec<TileCost> {
-    let hw = GFX1100Limits::default();
+    let hw = GpuHwLimits::for_target(target);
 
     let tile_m_candidates = [32u32, 64, 128];
     let tile_n_candidates = [64u32, 128]; // 128 enables larger output tiles (needs tile_ir path)
     let tile_k_candidates = [16u32, 32, 48, 64]; // k64 shows +5-60% gains vs k32 in benchmarks
     let waves_candidates = [2u32, 4, 8];
     let split_k_candidates = [1u32, 2, 4, 8];
+    let wgp_candidates: &[bool] = if hw.wgp_mode { &[false, true] } else { &[false] };
 
     let mut results = Vec::new();
     let lds_pad_candidates = [0u32, 4, 8];
@@ -436,7 +477,7 @@ pub fn auto_schedule_gemm(
                         if k % (sk * tile_k) != 0 { continue; }
                         if sk > k / tile_k { continue; }
 
-                        for &wgp in &[false, true] {
+                        for &wgp in wgp_candidates {
                             for &swap in &[true, false] {
                                 for &pad in &lds_pad_candidates {
                                     let config = TileConfig {
@@ -453,7 +494,9 @@ pub fn auto_schedule_gemm(
                                         // Verify final GemmConfig fits in 256 VGPRs
                                         // (to_gemm_config may split tile_n into multi-pass)
                                         let gc = config.to_gemm_config();
-                                        if !gc.is_feasible() { continue; }
+                                        if gemm_config_estimated_vgprs(&gc, target) > hw.max_vgprs {
+                                            continue;
+                                        }
                                         results.push(cost);
                                     }
                                 }
@@ -470,19 +513,30 @@ pub fn auto_schedule_gemm(
     results
 }
 
+pub fn auto_schedule_gemm(
+    m: u32, n: u32, k: u32,
+    fmt: DataFormat,
+) -> Vec<TileCost> {
+    auto_schedule_gemm_for_target(current_target(), m, n, k, fmt)
+}
+
 /// Get the single best GEMM tile configuration.
 /// Returns None if no feasible configuration exists.
+pub fn best_gemm_config_for_target(target: Target, m: u32, n: u32, k: u32, fmt: DataFormat) -> Option<TileCost> {
+    auto_schedule_gemm_for_target(target, m, n, k, fmt).into_iter().next()
+}
+
 pub fn best_gemm_config(m: u32, n: u32, k: u32, fmt: DataFormat) -> Option<TileCost> {
     auto_schedule_gemm(m, n, k, fmt).into_iter().next()
 }
 
 /// Print a comparison table of top N tile configurations.
-pub fn print_schedule_report(m: u32, n: u32, k: u32, fmt: DataFormat, top_n: usize) {
-    let results = auto_schedule_gemm(m, n, k, fmt);
+pub fn print_schedule_report_for_target(target: Target, m: u32, n: u32, k: u32, fmt: DataFormat, top_n: usize) {
+    let results = auto_schedule_gemm_for_target(target, m, n, k, fmt);
 
     eprintln!("╔══════════════════════════════════════════════════════════════════╗");
-    eprintln!("║  Auto-schedule GEMM: M={}, N={}, K={}, {:?}{}║",
-        m, n, k, fmt, " ".repeat(64usize.saturating_sub(48 + format!("{m}{n}{k}").len())));
+    eprintln!("║  Auto-schedule GEMM: M={}, N={}, K={}, {:?}, {:?} ║",
+        m, n, k, fmt, target);
     eprintln!("╠══════════════════════════════════════════════════════════════════╣");
     eprintln!("║ {:>3} {:>3} {:>3} {:>4}  {:>4} {:>4} {:>5} {:>4} {:>6} {:>8} ║",
         "tM", "tN", "tK", "WPG", "VGPR", "LDS", "Occ", "WGs", "Score", "Bound");
@@ -501,6 +555,10 @@ pub fn print_schedule_report(m: u32, n: u32, k: u32, fmt: DataFormat, top_n: usi
 
     eprintln!("╚══════════════════════════════════════════════════════════════════╝");
     eprintln!("Searched {} feasible configs", results.len());
+}
+
+pub fn print_schedule_report(m: u32, n: u32, k: u32, fmt: DataFormat, top_n: usize) {
+    print_schedule_report_for_target(current_target(), m, n, k, fmt, top_n);
 }
 
 // ============================================================================
@@ -580,6 +638,10 @@ impl TileConfig {
     }
 }
 
+fn gemm_config_estimated_vgprs(config: &super::gemm_gen::GemmConfig, target: Target) -> u32 {
+    config.estimated_vgprs_for_target(target)
+}
+
 /// CPU-only: predict the best GemmConfig for given dimensions using cost model.
 ///
 /// This is the primary autotune entry point — no GPU needed.
@@ -590,14 +652,17 @@ impl TileConfig {
 /// let cfg = cost_model::predict_best(1024, 1024, 1024);
 /// let kernel = gemm_gen::generate(&cfg);
 /// ```
-pub fn predict_best(m: u32, k: u32, n: u32) -> super::gemm_gen::GemmConfig {
-    let results = auto_schedule_gemm(m, n, k, DataFormat::BF16);
+pub fn predict_best_for_target(target: Target, m: u32, k: u32, n: u32) -> super::gemm_gen::GemmConfig {
+    let results = auto_schedule_gemm_for_target(target, m, n, k, DataFormat::BF16);
     if let Some(best) = results.first() {
         best.config.to_gemm_config()
     } else {
-        // Fallback: use gemm_gen's hand-tuned heuristic
         super::gemm_gen::auto_select_legacy(m, k, n)
     }
+}
+
+pub fn predict_best(m: u32, k: u32, n: u32) -> super::gemm_gen::GemmConfig {
+    predict_best_for_target(current_target(), m, k, n)
 }
 
 
@@ -637,14 +702,21 @@ pub struct KLoopAnalysis {
 /// Generate a GEMM kernel from a TileConfig and analyze its K-loop body.
 ///
 /// Returns None if the kernel cannot be generated or no K-loop is found.
-pub fn analyze_kloop(config: &TileConfig) -> Option<KLoopAnalysis> {
+pub fn analyze_kloop_for_target(target: Target, config: &TileConfig) -> Option<KLoopAnalysis> {
     use super::insn_latency;
     use super::ir::Op;
 
     let gemm_cfg = config.to_gemm_config();
     // Skip configs that exceed VGPR limit (would panic in generate)
-    if !gemm_cfg.is_feasible() { return None; }
-    let kernel = super::gemm_gen::generate(&gemm_cfg);
+    if gemm_config_estimated_vgprs(&gemm_cfg, target) > GpuHwLimits::for_target(target).max_vgprs {
+        return None;
+    }
+    let kernel = match std::panic::catch_unwind(|| {
+        with_target_context(target, || super::gemm_gen::generate(&gemm_cfg))
+    }) {
+        Ok(kernel) => kernel,
+        Err(_) => return None,
+    };
     let ops = kernel.ops();
 
     // Find the K-loop body between "ggen_loop" label and back-edge branch
@@ -730,11 +802,15 @@ pub fn analyze_kloop(config: &TileConfig) -> Option<KLoopAnalysis> {
     })
 }
 
+pub fn analyze_kloop(config: &TileConfig) -> Option<KLoopAnalysis> {
+    analyze_kloop_for_target(current_target(), config)
+}
+
 /// Print K-loop analysis report for a TileConfig.
-pub fn print_kloop_analysis(config: &TileConfig) {
-    if let Some(a) = analyze_kloop(config) {
+pub fn print_kloop_analysis_for_target(target: Target, config: &TileConfig) {
+    if let Some(a) = analyze_kloop_for_target(target, config) {
         eprintln!("╔═══════════════════════════════════════════════════╗");
-        eprintln!("║  K-loop insn analysis: {:>28}  ║", config.name());
+        eprintln!("║  K-loop insn analysis: {:>18} ({:?})  ║", config.name(), target);
         eprintln!("╠═══════════════════════════════════════════════════╣");
         eprintln!("║  Total: {} ops ({} issue cycles)             ", a.total_ops, a.issue_cycles);
         eprintln!("║  VALU:{:>3}  VTRANS:{:>3}  WMMA:{:>3}              ", a.valu, a.vtrans, a.wmma);
@@ -744,8 +820,12 @@ pub fn print_kloop_analysis(config: &TileConfig) {
         eprintln!("║  Cycles/iter (refined): {:.0}                    ", a.cycles_per_iter);
         eprintln!("╚═══════════════════════════════════════════════════╝");
     } else {
-        eprintln!("[kloop] No K-loop found for {}", config.name());
+        eprintln!("[kloop] No K-loop found for {} on {:?}", config.name(), target);
     }
+}
+
+pub fn print_kloop_analysis(config: &TileConfig) {
+    print_kloop_analysis_for_target(current_target(), config);
 }
 
 // ============================================================================
@@ -784,13 +864,16 @@ pub struct TileIrTuneResult {
 /// let result = tune_tile_ir(&rt, 4096, 4096, 4096)?;
 /// eprintln!("Best: {} ({:.1} TF)", result.best.name(), result.best_tflops);
 /// ```
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 pub fn tune_tile_ir(
     rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
     m: u32, n: u32, k: u32,
 ) -> Result<TileIrTuneResult, String> {
+    let target = rt.device.target();
+    let hw = GpuHwLimits::for_target(target);
+
     // 1. Check disk cache first
-    let cache_path = tile_ir_cache_path(m, n, k);
+    let cache_path = tile_ir_cache_path(target, m, n, k);
     if let Some(cached) = load_tile_ir_cache(&cache_path) {
         eprintln!("[tile_tune] Cache hit: {}×{}×{} → {} ({:.1} TF)",
             m, n, k, cached.best.name(), cached.best_tflops);
@@ -819,7 +902,7 @@ pub fn tune_tile_ir(
     for preset in &presets {
         let mut p = preset.clone();
         p.wgp_mode = false; // SAFETY: force consistent WGP mode
-        if p.lds_total() > 65536 { continue; }
+        if p.lds_total() > hw.lds_per_wg { continue; }
         if k % p.tile_k != 0 { continue; }
         if p.tile_m > m && m >= 32 { continue; }
         if p.tile_n > n && n >= 32 { continue; }
@@ -831,12 +914,12 @@ pub fn tune_tile_ir(
 
     // 2b. Cost-model discoveries (may find novel configs the presets miss)
     //     SAFETY: force wgp_mode=false on all cost-model candidates too.
-    let cost_results = auto_schedule_gemm(m, n, k, DataFormat::BF16);
+    let cost_results = auto_schedule_gemm_for_target(target, m, n, k, DataFormat::BF16);
     for cost in &cost_results {
         if !cost.config.can_use_tile_ir() { continue; }
         let mut spec = cost.config.to_tile_gemm();
         spec.wgp_mode = false; // SAFETY: consistent WGP mode
-        if spec.lds_total() > 65536 { continue; }
+        if spec.lds_total() > hw.lds_per_wg { continue; }
         let name = spec.name();
         if seen.contains(&name) { continue; }
         seen.insert(name);
@@ -849,6 +932,13 @@ pub fn tune_tile_ir(
 
     eprintln!("[tile_tune] Benchmarking {} tile_ir candidates for {}×{}×{} ...",
         candidates.len(), m, n, k);
+    eprintln!(
+        "[tile_tune] Using {:?} limits: CU={}, LDS/WG={}KB, peak={:.1} TF",
+        target,
+        hw.n_cus,
+        hw.lds_per_wg / 1024,
+        hw.peak_matrix_tflops,
+    );
 
     // 3. Pre-compile ALL candidates, keeping GpuKernels alive in a Vec.
     //
@@ -862,7 +952,7 @@ pub fn tune_tile_ir(
     // Fix: keep ALL kernels alive until the entire tune session completes. This matches
     // the pattern used by ensure_kernel_t0 (HashMap cache), which never drops code_bufs
     // and never hangs when switching between kernel configs.
-    use crate::kfd::{GpuKernel, KernelLoadConfig};
+    use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
 
     struct CompiledCandidate {
         spec: super::tile_ir::TileGemm,
@@ -874,9 +964,9 @@ pub fn tune_tile_ir(
     for spec in &candidates {
         let spec_clone = spec.clone();
         let compile_result = std::panic::catch_unwind(move || -> Result<(Vec<u8>, u32, u32), String> {
-            let kernel_ir = super::tile_ir::lower_gemm(&spec_clone);
+            let kernel_ir = with_target_context(target, || super::tile_ir::lower_gemm(&spec_clone));
             let base_lds = kernel_ir.lds_size();
-            let (elf, final_lds) = kernel_ir.compile_with_info(super::ir::Target::GFX1100)?;
+            let (elf, final_lds) = kernel_ir.compile_with_info(target)?;
             Ok((elf, base_lds, final_lds))
         });
         let (elf, base_lds, final_lds) = match compile_result {
@@ -941,10 +1031,13 @@ pub fn tune_tile_ir(
         );
         let grid = super::tile_ir::compute_grid(&cc.spec, m, n);
 
-        // Warmup: 10 sync dispatches for GPU clock ramp-up
+        // Warmup: 10 precise sync dispatches for GPU clock ramp-up.
+        // DXG queue read_ptr can advance before kernel retirement, so benchmark
+        // warmup must also use a completion signal to avoid overlapping with the
+        // timed region.
         let mut warmup_ok = true;
         for _ in 0..10 {
-            if let Err(e) = rt.dispatch(&cc.kernel, grid, &ka) {
+            if let Err(e) = rt.dispatch_precise(&cc.kernel, grid, &ka) {
                 eprintln!("[tile_tune]   {} → FAIL: warmup: {}", cc.spec.name(), e);
                 warmup_ok = false;
                 break;
@@ -958,14 +1051,13 @@ pub fn tune_tile_ir(
             continue;
         }
 
-        // Timed: batch-submit 20 async dispatches, wait once
+        // Timed: batch-submit 20 dispatches and wait for true completion on the
+        // final one via completion signal. This measures steady-state FIFO
+        // throughput without relying on queue read_ptr semantics.
         let n_iters = 20;
-        let t0 = std::time::Instant::now();
-        for _ in 0..n_iters {
-            rt.dispatch_async(&cc.kernel, grid, &ka);
-        }
-        match rt.wait_idle() {
-            Ok(()) => {},
+        #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+        let elapsed_us = match rt.dispatch_batch_profiled_gpu_us(&cc.kernel, grid, &ka, n_iters) {
+            Ok(elapsed_us) => elapsed_us,
             Err(e) => {
                 eprintln!("[tile_tune]   {} → FAIL: timed: {}", cc.spec.name(), e);
                 if e.contains("hung") || e.contains("TIMEOUT") {
@@ -974,8 +1066,23 @@ pub fn tune_tile_ir(
                 }
                 continue;
             }
-        }
-        let elapsed_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+        };
+        #[cfg(not(all(feature = "wsl_dxg", not(feature = "rocm"))))]
+        let elapsed_us = {
+            let t0 = std::time::Instant::now();
+            match rt.dispatch_batch_precise(&cc.kernel, grid, &ka, n_iters) {
+                Ok(()) => {},
+                Err(e) => {
+                    eprintln!("[tile_tune]   {} → FAIL: timed: {}", cc.spec.name(), e);
+                    if e.contains("hung") || e.contains("TIMEOUT") {
+                        eprintln!("[tile_tune] Queue poisoned, stopping benchmark");
+                        break;
+                    }
+                    continue;
+                }
+            }
+            t0.elapsed().as_micros() as f64 / n_iters as f64
+        };
 
         let total_flops = 2.0 * m as f64 * n as f64 * k as f64;
         let tflops = if elapsed_us > 0.0 { total_flops / (elapsed_us * 1e6) } else { 0.0 };
@@ -1023,8 +1130,8 @@ fn tile_ir_cache_dir() -> std::path::PathBuf {
     }
 }
 
-fn tile_ir_cache_path(m: u32, n: u32, k: u32) -> std::path::PathBuf {
-    tile_ir_cache_dir().join(format!("tile_ir_{}x{}x{}.json", m, n, k))
+fn tile_ir_cache_path(target: Target, m: u32, n: u32, k: u32) -> std::path::PathBuf {
+    tile_ir_cache_dir().join(format!("tile_ir_{}_{}x{}x{}.json", target.mcpu_str(), m, n, k))
 }
 
 fn load_tile_ir_cache(path: &std::path::Path) -> Option<TileIrTuneResult> {
@@ -1106,10 +1213,23 @@ mod tests {
 
     #[test]
     fn test_hw_limits_default() {
-        let hw = GFX1100Limits::default();
+        let hw = GpuHwLimits::default();
+        assert_eq!(hw.target, Target::GFX1100);
         assert_eq!(hw.max_vgprs, 256);
         assert_eq!(hw.n_cus, 96);
         assert_eq!(hw.lds_per_wg, 65536);
+    }
+
+    #[test]
+    fn test_hw_limits_gfx1201() {
+        let hw = GpuHwLimits::for_target(Target::GFX1201);
+        assert_eq!(hw.target, Target::GFX1201);
+        assert_eq!(hw.max_vgprs, 256);
+        assert_eq!(hw.max_sgprs, 106);
+        assert_eq!(hw.lds_per_wg, 65536);
+        assert_eq!(hw.lds_per_cu, 65536);
+        assert_eq!(hw.n_cus, 56);
+        assert_eq!(hw.l2_cache_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
@@ -1129,7 +1249,7 @@ mod tests {
             tile_m: 32, tile_n: 64, tile_k: 16, waves_per_wg: 2, use_lds: true,
             split_k: 1, wgp_mode: false, swap_grid: true, lds_pad: 0,
         };
-        let hw = GFX1100Limits::default();
+        let hw = GpuHwLimits::default();
         let cost = estimate_tile_cost(&config, 4096, 4096, 512, DataFormat::BF16, &hw);
         assert!(cost.feasible, "hand-tuned config should be feasible");
         assert!(cost.vgprs <= 256, "VGPRs should fit: {}", cost.vgprs);
@@ -1151,9 +1271,19 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_schedule_returns_results_gfx1201() {
+        let results = auto_schedule_gemm_for_target(Target::GFX1201, 4096, 4096, 512, DataFormat::BF16);
+        assert!(!results.is_empty(), "should find at least 1 feasible gfx1201 config");
+        let best = &results[0];
+        assert!(best.feasible);
+        assert!(best.score > 0.0);
+        assert!(best.vgprs <= GpuHwLimits::for_target(Target::GFX1201).max_vgprs);
+    }
+
+    #[test]
     fn test_auto_schedule_respects_limits() {
         let results = auto_schedule_gemm(4096, 4096, 512, DataFormat::BF16);
-        let hw = GFX1100Limits::default();
+        let hw = GpuHwLimits::default();
 
         for cost in &results {
             assert!(cost.vgprs <= hw.max_vgprs, "VGPRs {} exceeds {}", cost.vgprs, hw.max_vgprs);
@@ -1184,7 +1314,7 @@ mod tests {
             tile_m: 64, tile_n: 128, tile_k: 32, waves_per_wg: 1, use_lds: true,
             split_k: 1, wgp_mode: false, swap_grid: true, lds_pad: 0,
         };
-        let hw = GFX1100Limits::default();
+        let hw = GpuHwLimits::default();
         let cost = estimate_tile_cost(&config, 4096, 4096, 512, DataFormat::BF16, &hw);
         if cost.feasible {
             assert!(cost.occupancy <= 4, "large tile should have low occupancy: {}", cost.occupancy);
@@ -1196,7 +1326,7 @@ mod tests {
 
     #[test]
     fn test_lds_padding_increases_lds_usage() {
-        let hw = GFX1100Limits::default();
+        let hw = GpuHwLimits::default();
         let base = TileConfig {
             tile_m: 128, tile_n: 64, tile_k: 16, waves_per_wg: 4, use_lds: true,
             split_k: 1, wgp_mode: false, swap_grid: true, lds_pad: 0,
@@ -1266,14 +1396,16 @@ mod tests {
 
     /// GPU E2E: tune tile_ir for 4096³ GEMM
     #[test]
-    #[cfg(feature = "rocm")]
-    #[ignore] // Run explicitly: cargo test --release --features rocm -- test_tune_tile_ir_4096 --ignored --nocapture
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+    #[ignore] // Run explicitly: cargo test --release --features wsl_dxg -- test_tune_tile_ir_4096 --nocapture --ignored --test-threads=1
     fn test_tune_tile_ir_4096() {
         let rt = crate::ignis::gpu_context::GpuRuntime::new()
             .expect("GpuRuntime::new");
+        let target = rt.device.target();
+        let hw = GpuHwLimits::for_target(target);
 
         // Clear cache for fresh benchmark
-        let cache = tile_ir_cache_path(4096, 4096, 4096);
+        let cache = tile_ir_cache_path(target, 4096, 4096, 4096);
         let _ = std::fs::remove_file(&cache);
 
         let result = tune_tile_ir(&rt, 4096, 4096, 4096)
@@ -1282,6 +1414,8 @@ mod tests {
         eprintln!("\n╔══════════════════════════════════════════╗");
         eprintln!("║  tile_ir tune: 4096³ GEMM BF16           ║");
         eprintln!("╠══════════════════════════════════════════╣");
+        eprintln!("║  Target: {:>28?} ║", target);
+        eprintln!("║  Limit:  {:>11} CU / {:>4} KB LDS     ║", hw.n_cus, hw.lds_per_wg / 1024);
         eprintln!("║  Best: {:>30} ║", result.best.name());
         eprintln!("║  TFLOPS: {:>8.1}                        ║", result.best_tflops);
         eprintln!("╠──────────────────────────────────────────╣");
@@ -1304,7 +1438,7 @@ mod tests {
 
     /// GPU E2E: tune tile_ir for 9 standard sizes
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[ignore]
     fn test_tune_tile_ir_all_sizes() {
         let rt = crate::ignis::gpu_context::GpuRuntime::new()
@@ -1330,7 +1464,7 @@ mod tests {
 
         for &(m, k, n) in &sizes {
             // Clear cache for each size
-            let _ = std::fs::remove_file(tile_ir_cache_path(m, n, k));
+            let _ = std::fs::remove_file(tile_ir_cache_path(rt.device.target(), m, n, k));
 
             match tune_tile_ir(&rt, m, n, k) {
                 Ok(result) => {

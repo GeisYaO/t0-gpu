@@ -119,11 +119,11 @@ mod tests {
         eprintln!("✓ scale: {} bytes ELF", ck.elf.len());
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_memcpy_gpu() {
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         use std::sync::{Arc, OnceLock};
 
         struct SyncRt(Arc<GpuRuntime>);
@@ -162,11 +162,11 @@ mod tests {
         eprintln!("✓ memcpy GPU: n={}, max_err={:.2e}", n, max_err);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_residual_add_gpu() {
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         use std::sync::{Arc, OnceLock};
 
         struct SyncRt(Arc<GpuRuntime>);

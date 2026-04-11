@@ -3,6 +3,7 @@
 //! Defines virtual registers and operations for the T0 kernel compiler.
 //! All registers are virtual — physical allocation happens in regalloc.rs.
 
+use std::cell::Cell;
 use std::fmt;
 
 // ============================================================================
@@ -151,9 +152,10 @@ pub enum SOperand {
 // ============================================================================
 
 /// GPU target architecture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     GFX1100,  // RDNA3, Navi 31
+    GFX1201,  // RDNA4, Navi 48 / RX 9070 class
     // Future: GFX1030, GFX900, etc.
 }
 
@@ -161,6 +163,109 @@ impl Target {
     pub fn mcpu_str(&self) -> &'static str {
         match self {
             Target::GFX1100 => "gfx1100",
+            Target::GFX1201 => "gfx1201",
+        }
+    }
+
+    pub fn isa_triple(&self) -> &'static str {
+        match self {
+            Target::GFX1100 => "amdgcn-amd-amdhsa--gfx1100",
+            Target::GFX1201 => "amdgcn-amd-amdhsa--gfx1201",
+        }
+    }
+
+    pub fn elf_flags(&self) -> u32 {
+        match self {
+            // LLVM 21: ELF::EF_AMDGPU_MACH_AMDGCN_GFX1100
+            Target::GFX1100 => 0x041,
+            // LLVM 21: ELF::EF_AMDGPU_MACH_AMDGCN_GFX1201
+            Target::GFX1201 => 0x04e,
+        }
+    }
+}
+
+thread_local! {
+    static TARGET_CONTEXT: Cell<Target> = Cell::new(Target::GFX1100);
+}
+
+/// Return the target currently in scope for target-sensitive IR helpers.
+///
+/// Defaults to `GFX1100` so existing non-targeted call sites preserve the
+/// original behavior unless a compiler/runtime path installs a specific target.
+pub fn current_target() -> Target {
+    TARGET_CONTEXT.with(|slot| slot.get())
+}
+
+/// Execute `f` with a temporary target context.
+pub fn with_target_context<R>(target: Target, f: impl FnOnce() -> R) -> R {
+    TARGET_CONTEXT.with(|slot| {
+        let prev = slot.replace(target);
+        let result = f();
+        slot.set(prev);
+        result
+    })
+}
+
+impl WmmaFormat {
+    pub const fn dst_vreg_count(self, target: Target) -> u32 {
+        match target {
+            Target::GFX1100 => 8,
+            Target::GFX1201 => match self {
+                WmmaFormat::BF16_F32 | WmmaFormat::F16_F32 => 8,
+                WmmaFormat::BF16_BF16 => 4,
+            },
+        }
+    }
+
+    pub const fn a_vreg_count(self, target: Target) -> u32 {
+        match target {
+            Target::GFX1100 => 8,
+            Target::GFX1201 => 4,
+        }
+    }
+
+    pub const fn b_vreg_count(self, target: Target) -> u32 {
+        self.a_vreg_count(target)
+    }
+
+    pub const fn c_vreg_count(self, target: Target) -> u32 {
+        match target {
+            Target::GFX1100 => 8,
+            Target::GFX1201 => match self {
+                WmmaFormat::BF16_F32 | WmmaFormat::F16_F32 => 8,
+                WmmaFormat::BF16_BF16 => 4,
+            },
+        }
+    }
+
+    pub const fn dst_alignment(self, target: Target) -> Alignment {
+        match target {
+            Target::GFX1100 => Alignment::Align8,
+            Target::GFX1201 => match self {
+                WmmaFormat::BF16_F32 | WmmaFormat::F16_F32 => Alignment::Align8,
+                WmmaFormat::BF16_BF16 => Alignment::Align4,
+            },
+        }
+    }
+
+    pub const fn a_alignment(self, target: Target) -> Alignment {
+        match target {
+            Target::GFX1100 => Alignment::Align8,
+            Target::GFX1201 => Alignment::Align4,
+        }
+    }
+
+    pub const fn b_alignment(self, target: Target) -> Alignment {
+        self.a_alignment(target)
+    }
+
+    pub const fn c_alignment(self, target: Target) -> Alignment {
+        match target {
+            Target::GFX1100 => Alignment::Align8,
+            Target::GFX1201 => match self {
+                WmmaFormat::BF16_F32 | WmmaFormat::F16_F32 => Alignment::Align8,
+                WmmaFormat::BF16_BF16 => Alignment::Align4,
+            },
         }
     }
 }
@@ -260,10 +365,10 @@ pub enum Op {
 
     // ── WMMA (Wave Matrix Multiply Accumulate) ──
     Wmma {
-        dst: VReg,  // first of 8 consecutive VGPRs
-        a: VReg,    // first of 8 consecutive VGPRs (A fragment)
-        b: VReg,    // first of 8 consecutive VGPRs (B fragment)
-        c: VReg,    // first of 8 consecutive VGPRs (accumulator input)
+        dst: VReg,  // first VGPR of target-dependent destination fragment
+        a: VReg,    // first VGPR of target-dependent A fragment
+        b: VReg,    // first VGPR of target-dependent B fragment
+        c: VReg,    // first VGPR of target-dependent accumulator input
         format: WmmaFormat,
     },
 
@@ -566,13 +671,25 @@ impl Op {
             Op::SMov { .. } | Op::SCmpLtU32 { .. } |
             Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => vec![],
 
-            // WMMA: 8 consecutive VGPRs for each of dst, a, b, c
-            Op::Wmma { dst, a, b, c, .. } => {
-                let mut v = Vec::with_capacity(32);
-                for i in 0..8u32 {
+            // WMMA: register footprint depends on target ISA variant
+            Op::Wmma { dst, a, b, c, format } => {
+                let target = current_target();
+                let mut v = Vec::with_capacity(
+                    (format.dst_vreg_count(target)
+                     + format.a_vreg_count(target)
+                     + format.b_vreg_count(target)
+                     + format.c_vreg_count(target)) as usize
+                );
+                for i in 0..format.dst_vreg_count(target) {
                     v.push(VReg(dst.0 + i));
+                }
+                for i in 0..format.a_vreg_count(target) {
                     v.push(VReg(a.0 + i));
+                }
+                for i in 0..format.b_vreg_count(target) {
                     v.push(VReg(b.0 + i));
+                }
+                for i in 0..format.c_vreg_count(target) {
                     v.push(VReg(c.0 + i));
                 }
                 v
@@ -722,8 +839,11 @@ impl Op {
             Op::ComputeGlobalIdX { dst, .. } |
             Op::ReadShaderCycles { dst, .. } => vec![*dst],
 
-            // WMMA defines 8 consecutive dst VGPRs
-            Op::Wmma { dst, .. } => (0..8).map(|i| VReg(dst.0 + i)).collect(),
+            // WMMA defines a target-dependent destination fragment
+            Op::Wmma { dst, format, .. } => {
+                let target = current_target();
+                (0..format.dst_vreg_count(target)).map(|i| VReg(dst.0 + i)).collect()
+            }
 
             // Wave reductions modify val in-place
             Op::WaveReduceAddF32 { val, .. } | Op::WaveReduceMaxF32 { val, .. } => vec![*val],
@@ -808,12 +928,21 @@ impl Op {
             Op::SMov { .. } | Op::SCmpLtU32 { .. } |
             Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => vec![],
 
-            // ── WMMA: a, b, c are reads; dst is write only ──
-            Op::Wmma { a, b, c, .. } => {
-                let mut v = Vec::with_capacity(24);
-                for i in 0..8u32 {
+            // ── WMMA: source footprint depends on target ISA variant ──
+            Op::Wmma { a, b, c, format, .. } => {
+                let target = current_target();
+                let mut v = Vec::with_capacity(
+                    (format.a_vreg_count(target)
+                     + format.b_vreg_count(target)
+                     + format.c_vreg_count(target)) as usize
+                );
+                for i in 0..format.a_vreg_count(target) {
                     v.push(VReg(a.0 + i));
+                }
+                for i in 0..format.b_vreg_count(target) {
                     v.push(VReg(b.0 + i));
+                }
+                for i in 0..format.c_vreg_count(target) {
                     v.push(VReg(c.0 + i));
                 }
                 v

@@ -4,7 +4,7 @@
 //! and backs off when NaN/Inf is detected.
 
 #[cfg(feature = "rocm")]
-use crate::kfd::GpuBuffer;
+use crate::gpu_backend::GpuBuffer;
 #[cfg(feature = "rocm")]
 use super::tensor::Tensor;
 

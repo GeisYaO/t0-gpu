@@ -11,6 +11,7 @@ use super::regalloc::RegAlloc;
 pub struct AsmEmitter {
     buf: String,
     indent: &'static str,
+    target: Target,
     // Waitcnt tracking: count outstanding memory ops to avoid redundant waits
     outstanding_vmcnt: u32,   // pending global loads
     outstanding_lgkmcnt: u32, // pending LDS / scalar loads
@@ -28,6 +29,7 @@ impl AsmEmitter {
         Self {
             buf: String::with_capacity(8192),
             indent: "  ",
+            target: Target::GFX1100,
             outstanding_vmcnt: 0,
             outstanding_lgkmcnt: 0,
             outstanding_vscnt: 0,
@@ -50,6 +52,8 @@ impl AsmEmitter {
         lds_size: u32,
         wgp_mode: bool,
     ) {
+        self.target = target;
+
         // Header
         writeln!(self.buf, ".amdgcn_target \"amdgcn-amd-amdhsa--{}\"", target.mcpu_str()).unwrap();
         writeln!(self.buf).unwrap();
@@ -136,10 +140,14 @@ impl AsmEmitter {
                     }
                 }
                 // Also check multi-VGPR sources (WMMA uses v[N:N+7])
-                if let Op::Wmma { a: va, b: vb, c: vc, .. } = op {
-                    for base_vreg in [va, vb, vc] {
+                if let Op::Wmma { a: va, b: vb, c: vc, format, .. } = op {
+                    for (base_vreg, regs) in [
+                        (va, format.a_vreg_count(self.target)),
+                        (vb, format.b_vreg_count(self.target)),
+                        (vc, format.c_vreg_count(self.target)),
+                    ] {
                         let base_phys = a.phys_v(*base_vreg) as usize;
-                        for off in 0..8usize {
+                        for off in 0..regs as usize {
                             let p = base_phys + off;
                             if p < 256 {
                                 let last = self.last_writer[p];
@@ -168,9 +176,9 @@ impl AsmEmitter {
                     }
                 }
                 // Multi-VGPR defs (WMMA writes v[dst:dst+7])
-                if let Op::Wmma { dst, .. } = op {
+                if let Op::Wmma { dst, format, .. } = op {
                     let base_phys = a.phys_v(*dst) as usize;
-                    for off in 0..8usize {
+                    for off in 0..format.dst_vreg_count(self.target) as usize {
                         let p = base_phys + off;
                         if p < 256 {
                             self.last_writer[p] = self.valu_count;
@@ -219,7 +227,12 @@ impl AsmEmitter {
                 };
                 let dst_str = vreg_range_str(vd, width.vreg_count());
                 let soff_str = if *soffset == SOFFSET_ZERO {
-                    "0".to_string()
+                    match self.target {
+                        Target::GFX1100 => "0".to_string(),
+                        // gfx1201 llvm-mc rejects literal "0" for MUBUF soffset syntax.
+                        // Use scalar null register (encodes zero) instead of s0.
+                        Target::GFX1201 => "null".to_string(),
+                    }
                 } else {
                     format!("s{}", a.phys_s(*soffset))
                 };
@@ -245,7 +258,12 @@ impl AsmEmitter {
                 };
                 let src_str = vreg_range_str(vs, width.vreg_count());
                 let soff_str = if *soffset == SOFFSET_ZERO {
-                    "0".to_string()
+                    match self.target {
+                        Target::GFX1100 => "0".to_string(),
+                        // gfx1201 llvm-mc rejects literal "0" for MUBUF soffset syntax.
+                        // Use scalar null register (encodes zero) instead of s0.
+                        Target::GFX1201 => "null".to_string(),
+                    }
                 } else {
                     format!("s{}", a.phys_s(*soffset))
                 };
@@ -503,9 +521,16 @@ impl AsmEmitter {
                     WmmaFormat::F16_F32 => "v_wmma_f32_16x16x16_f16",
                     WmmaFormat::BF16_BF16 => "v_wmma_bf16_16x16x16_bf16",
                 };
+                let dst_regs = format.dst_vreg_count(self.target);
+                let a_regs = format.a_vreg_count(self.target);
+                let b_regs = format.b_vreg_count(self.target);
+                let c_regs = format.c_vreg_count(self.target);
                 writeln!(self.buf, "{}{} v[{}:{}], v[{}:{}], v[{}:{}], v[{}:{}]",
                     self.indent, instr,
-                    d, d + 7, pa, pa + 7, pb, pb + 7, pc, pc + 7).unwrap();
+                    d, u32::from(d) + dst_regs - 1,
+                    pa, u32::from(pa) + a_regs - 1,
+                    pb, u32::from(pb) + b_regs - 1,
+                    pc, u32::from(pc) + c_regs - 1).unwrap();
             }
 
             // ── Control flow ──
@@ -521,7 +546,15 @@ impl AsmEmitter {
 
             // ── Synchronization ──
             Op::Barrier => {
-                writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                match self.target {
+                    Target::GFX1100 => {
+                        writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                    }
+                    Target::GFX1201 => {
+                        writeln!(self.buf, "{}s_barrier_signal -1", self.indent).unwrap();
+                        writeln!(self.buf, "{}s_barrier_wait -1", self.indent).unwrap();
+                    }
+                }
             }
             Op::WaitVmcnt(n) => {
                 if self.outstanding_vmcnt > 0 || *n > 0 {
@@ -546,7 +579,14 @@ impl AsmEmitter {
             Op::WaitVscnt(n) => {
                 if self.outstanding_vscnt > 0 || *n > 0 {
                     let actual = (*n as u32).min(self.outstanding_vscnt);
-                    writeln!(self.buf, "{}s_waitcnt_vscnt null, {:#x}", self.indent, actual).unwrap();
+                    match self.target {
+                        Target::GFX1100 => {
+                            writeln!(self.buf, "{}s_waitcnt_vscnt null, {:#x}", self.indent, actual).unwrap();
+                        }
+                        Target::GFX1201 => {
+                            writeln!(self.buf, "{}s_wait_storecnt {:#x}", self.indent, actual).unwrap();
+                        }
+                    }
                     self.outstanding_vscnt = actual;
                     self.waits_emitted += 1;
                 } else {
@@ -788,7 +828,15 @@ impl AsmEmitter {
                     self.indent, vd, va, offset).unwrap();
             }
             Op::SBarrier => {
-                writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                match self.target {
+                    Target::GFX1100 => {
+                        writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
+                    }
+                    Target::GFX1201 => {
+                        writeln!(self.buf, "{}s_barrier_signal -1", self.indent).unwrap();
+                        writeln!(self.buf, "{}s_barrier_wait -1", self.indent).unwrap();
+                    }
+                }
             }
 
             Op::VCmpLtU32 { src0, src1 } => {
@@ -970,7 +1018,7 @@ impl AsmEmitter {
 
     /// Get the generated assembly text.
     pub fn finish(self) -> String {
-        if self.waits_elided > 0 {
+        if self.waits_elided > 0 && super::verbose_diagnostics_enabled() {
             eprintln!(
                 "[T0 AsmEmitter] Waitcnt stats: {} emitted, {} elided (redundant)",
                 self.waits_emitted, self.waits_elided

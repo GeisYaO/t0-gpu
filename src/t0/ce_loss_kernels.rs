@@ -238,11 +238,11 @@ mod tests {
         eprintln!("✓ ce_bwd: {} bytes ELF", ck.elf.len());
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_ce_loss_fwd_gpu() {
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         use std::sync::{Arc, OnceLock};
 
         struct SyncRt(Arc<GpuRuntime>);
@@ -321,11 +321,11 @@ mod tests {
     }
 
     /// Standalone log_softmax GPU test — isolates whether log_softmax alone hangs
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_log_softmax_gpu_only() {
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         use std::sync::{Arc, OnceLock};
 
         struct SyncRt(Arc<GpuRuntime>);
@@ -391,11 +391,11 @@ mod tests {
     }
 
     /// Standalone nll_loss GPU test
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_nll_loss_gpu_only() {
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         use std::sync::{Arc, OnceLock};
 
         struct SyncRt(Arc<GpuRuntime>);

@@ -5,14 +5,14 @@ use std::collections::HashMap;
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
-use crate::kfd::{GpuBuffer, KfdDevice};
+use crate::gpu_backend::{GpuBuffer, GpuDevice};
 
 /// GPU buffer pool with power-of-2 bucket caching.
 ///
 /// Reuses freed buffers to avoid expensive KFD alloc/free ioctls.
 #[cfg(feature = "rocm")]
 pub struct BufferPool {
-    device: Arc<KfdDevice>,
+    device: Arc<GpuDevice>,
     buckets: HashMap<usize, Vec<GpuBuffer>>,
     hits: u64,
     misses: u64,
@@ -20,7 +20,7 @@ pub struct BufferPool {
 
 #[cfg(feature = "rocm")]
 impl BufferPool {
-    pub fn new(device: &Arc<KfdDevice>) -> Self {
+    pub fn new(device: &Arc<GpuDevice>) -> Self {
         Self {
             device: device.clone(),
             buckets: HashMap::new(),

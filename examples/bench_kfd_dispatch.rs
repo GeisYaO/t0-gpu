@@ -18,7 +18,7 @@ fn main() -> Result<(), String> {
     let elf = k.compile(Target::GFX1100)?;
     eprintln!("  ✓ {} bytes ELF", elf.len());
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 

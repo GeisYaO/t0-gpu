@@ -1332,7 +1332,7 @@ mod tests {
         eprintln!("  ✓ probe_vmem_latency OK ({} bytes)", asm.len());
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_compile_all_latency_probes() {
         for &op in ALL_PROBES {
@@ -1348,7 +1348,7 @@ mod tests {
 
     // ── GPU E2E: full sweep ──
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     mod gpu_e2e {
         use super::*;
         use std::sync::{Arc, OnceLock};

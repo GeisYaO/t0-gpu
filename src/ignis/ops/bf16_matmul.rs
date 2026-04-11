@@ -10,7 +10,7 @@
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
-use crate::kfd::{GpuBuffer, KfdDevice};
+use crate::gpu_backend::{GpuBuffer, GpuDevice};
 #[cfg(feature = "rocm")]
 use super::super::tensor::{Tensor, DType};
 #[cfg(feature = "rocm")]
@@ -30,7 +30,7 @@ use super::super::gpu_context::GpuRuntime;
 /// Internally converts to bf16 for WMMA, accumulates in f32.
 /// Pads M/N to tile boundaries to handle any dimension.
 #[cfg(feature = "rocm")]
-pub fn matmul(x: &Tensor, w: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn matmul(x: &Tensor, w: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let x_shape = x.shape();
     let w_shape = w.shape();
     assert_eq!(x_shape.len(), 2, "matmul: X must be 2D, got {:?}", x_shape);

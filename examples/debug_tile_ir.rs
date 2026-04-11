@@ -79,7 +79,7 @@ fn main() -> Result<(), String> {
     eprintln!("[gemm_gen] ELF: {} bytes", gemm_elf.len());
 
     // ─── 4. GPU 测试（最小尺寸：单 tile） ───
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 

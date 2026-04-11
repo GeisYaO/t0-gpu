@@ -1,7 +1,7 @@
 //! Focused thin-matrix (small M) benchmark
 //! Tests many tile/WGP/split-K/grid combinations on M=128,256 × K=1024 × N=4096
 
-use t0_gpu::t0::{GFX1100Schedule, Schedule, Target};
+use t0_gpu::t0::Target;
 use t0_gpu::t0::gemm_gen::{GemmConfig, generate, compute_grid, compute_grid_split_k};
 
 fn main() -> Result<(), String> {
@@ -68,7 +68,7 @@ fn main() -> Result<(), String> {
     }
     eprintln!(" done ({} compiled)", compiled.iter().filter(|x| x.is_some()).count());
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
         use std::time::Instant;

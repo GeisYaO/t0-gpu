@@ -17,7 +17,7 @@ fn main() -> Result<(), String> {
         ("128x64_k16", GemmConfig::tile_128x64_k16()),
     ];
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
         use t0_gpu::t0::gemm_gen::compute_grid_auto;

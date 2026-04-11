@@ -175,11 +175,11 @@ mod tests {
         eprintln!("✓ causal_mask_bwd: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_causal_mask_gpu() {
         use crate::ignis::gpu_context::GpuRuntime;
-        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
         use std::sync::{Arc, OnceLock};
 
         struct SyncRt(Arc<GpuRuntime>);

@@ -12,9 +12,10 @@ repository = "https://github.com/GeisYaO/t0-gpu"
 [features]
 default = []
 rocm = []  # Enable KFD runtime (requires /dev/kfd)
+wsl_dxg = []  # Enable WSL2 DXG runtime (requires /dev/dxg, links libdxg)
 
 [dependencies]
-# No external dependencies — pure Rust
+libc = "0.2"
 
 [[bin]]
 name = "isa_probe"

@@ -1,5 +1,5 @@
 //! Validate auto_select: safe pattern with per-size Y allocation 
-use t0_gpu::t0::{GFX1100Schedule, Schedule, Target};
+use t0_gpu::t0::Target;
 use t0_gpu::t0::gemm_gen::{GemmConfig, generate, compute_grid_auto, auto_select, build_kernargs};
 
 fn main() -> Result<(), String> {
@@ -42,7 +42,7 @@ fn main() -> Result<(), String> {
     }
     eprintln!("  OK");
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
         use std::time::Instant;

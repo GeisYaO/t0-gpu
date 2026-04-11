@@ -5,7 +5,7 @@
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
-use crate::kfd::{GpuBuffer, KfdDevice};
+use crate::gpu_backend::{GpuBuffer, GpuDevice};
 #[cfg(feature = "rocm")]
 use super::super::tensor::Tensor;
 #[cfg(feature = "rocm")]
@@ -18,7 +18,7 @@ use super::super::gpu_context::GpuRuntime;
 /// Reshape tensor (zero-copy if same numel).
 /// Backward: reshape grad back to original shape.
 #[cfg(feature = "rocm")]
-pub fn reshape(a: &Tensor, new_shape: &[usize], _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn reshape(a: &Tensor, new_shape: &[usize], _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let old_numel: usize = a.shape().iter().product();
     let new_numel: usize = new_shape.iter().product();
     assert_eq!(old_numel, new_numel, "reshape: numel mismatch {} vs {}", old_numel, new_numel);
@@ -49,7 +49,7 @@ pub fn reshape(a: &Tensor, new_shape: &[usize], _device: &Arc<KfdDevice>) -> Res
 /// Transpose 2D: [M, N] → [N, M]
 /// Backward: transpose grad back
 #[cfg(feature = "rocm")]
-pub fn transpose(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn transpose(a: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let shape = a.shape();
     assert_eq!(shape.len(), 2, "transpose: need 2D tensor, got {:?}", shape);
     let (m, n) = (shape[0], shape[1]);
@@ -93,7 +93,7 @@ pub fn transpose(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String>
 
 /// Slice rows: output = a[start..end, :]
 #[cfg(feature = "rocm")]
-pub fn slice_rows(a: &Tensor, start: usize, end: usize, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn slice_rows(a: &Tensor, start: usize, end: usize, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let shape = a.shape();
     assert!(shape.len() >= 2, "slice: need at least 2D");
     let cols = shape[shape.len() - 1];
@@ -140,7 +140,7 @@ pub fn slice_rows(a: &Tensor, start: usize, end: usize, _device: &Arc<KfdDevice>
 
 /// Negate: output = -a
 #[cfg(feature = "rocm")]
-pub fn neg(a: &Tensor, device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn neg(a: &Tensor, device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     super::add::scale(a, -1.0, device)
 }
 
@@ -148,7 +148,7 @@ pub fn neg(a: &Tensor, device: &Arc<KfdDevice>) -> Result<Tensor, String> {
 
 /// Subtract: output = a - b
 #[cfg(feature = "rocm")]
-pub fn sub(a: &Tensor, b: &Tensor, device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn sub(a: &Tensor, b: &Tensor, device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let neg_b = super::add::scale(b, -1.0, device)?;
     super::add::add(a, &neg_b, device)
 }
@@ -157,7 +157,7 @@ pub fn sub(a: &Tensor, b: &Tensor, device: &Arc<KfdDevice>) -> Result<Tensor, St
 
 /// Mean of all elements → scalar
 #[cfg(feature = "rocm")]
-pub fn mean(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn mean(a: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let n = a.numel();
     let runtime = a.runtime().clone();
 
@@ -192,7 +192,7 @@ pub fn mean(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
 
 /// ReLU: output[i] = max(0, a[i])
 #[cfg(feature = "rocm")]
-pub fn relu(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn relu(a: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let n = a.numel();
     let runtime = a.runtime().clone();
 
@@ -266,7 +266,7 @@ pub fn relu(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
 /// Softmax along last dimension.
 /// Backward: d_input = softmax * (d_output - sum(d_output * softmax))
 #[cfg(feature = "rocm")]
-pub fn softmax(a: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn softmax(a: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     let shape = a.shape().to_vec();
     let dim = *shape.last().unwrap();
     let rows = a.numel() / dim;

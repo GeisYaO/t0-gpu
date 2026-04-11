@@ -9,7 +9,7 @@
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
 #[cfg(feature = "rocm")]
-use crate::kfd::{GpuBuffer, KfdDevice};
+use crate::gpu_backend::{GpuBuffer, GpuDevice};
 #[cfg(feature = "rocm")]
 use super::super::tensor::{Tensor, DType};
 #[cfg(feature = "rocm")]
@@ -23,7 +23,7 @@ use super::super::tape::Tape;
 /// - `gate`: gate projection output [batch*seq, ffn_dim]
 /// - `up`: up projection output [batch*seq, ffn_dim]
 #[cfg(feature = "rocm")]
-pub fn silu_gate(gate: &Tensor, up: &Tensor, _device: &Arc<KfdDevice>) -> Result<Tensor, String> {
+pub fn silu_gate(gate: &Tensor, up: &Tensor, _device: &Arc<GpuDevice>) -> Result<Tensor, String> {
     assert_eq!(gate.shape(), up.shape(), "silu_gate: shape mismatch");
     let n = gate.numel();
     let runtime = gate.runtime().clone();

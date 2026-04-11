@@ -161,6 +161,13 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
     let (_tile_m, _tile_n) = sched.gemm_tile_mn();
     let tile_k = sched.gemm_tile_k();
     let n_tiles = sched.gemm_n_wmma_tiles();  // tile_n / 16
+    let target = sched.target();
+    let wmma_format = sched.wmma_format();
+    let frag_regs = wmma_format.a_vreg_count(target);
+    let frag_align = wmma_format.a_alignment(target);
+    let frag_loads = frag_regs / 4;
+    let acc_regs = wmma_format.dst_vreg_count(target);
+    let acc_align = wmma_format.dst_alignment(target);
 
     // ── Args ──
     let x_ptr = k.arg_ptr("X");
@@ -192,12 +199,12 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
 
     // ── Accumulator allocation ──
     let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .map(|_| k.alloc_vreg_array(acc_regs, acc_align))
         .collect();
 
     // Zero accumulators
     for a in &acc {
-        for i in 0..8u32 {
+        for i in 0..acc_regs {
             k.v_mov_imm(VReg(a.0 + i), 0);
         }
     }
@@ -239,9 +246,9 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
     k.v_lshlrev_b32(wt_row_off, 1, wt_row_off);
 
     // ── WMMA fragments ──
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
+    let x_frag = k.alloc_vreg_array(frag_regs, frag_align);
     let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .map(|_| k.alloc_vreg_array(frag_regs, frag_align))
         .collect();
 
     // ── K-loop ──
@@ -253,16 +260,17 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
     let loop_label = k.make_label("k_loop");
     k.label(&loop_label);
 
-    // Load X fragment: 2× global_load_b128 (8 bf16 values = 16 bytes each)
+    // Load X fragment: target-specific BF16 WMMA fragment
     let x_addr = k.alloc_vreg_array(2, Alignment::Align2);
     k.v_mov(x_addr, x_base);
     k.v_mov(VReg(x_addr.0 + 1), VReg(x_base.0 + 1));
     k.v_add_co(x_addr, x_addr, k_byte_off);
     k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
-    k.global_load(x_frag, x_addr, Width::B128, 0);
-    k.global_load(VReg(x_frag.0 + 4), x_addr, Width::B128, 16);
+    for i in 0..frag_loads {
+        k.global_load(VReg(x_frag.0 + i * 4), x_addr, Width::B128, (i * 16) as i32);
+    }
 
-    // Load WT fragments: n_tiles × 2× global_load_b128
+    // Load WT fragments: n_tiles × target-specific BF16 WMMA fragment
     let wt_addr = k.alloc_vreg_array(2, Alignment::Align2);
     k.v_mov_from_sgpr(wt_addr, SReg(wt_ptr.0));
     k.v_mov_from_sgpr(VReg(wt_addr.0 + 1), SReg(wt_ptr.0 + 1));
@@ -277,8 +285,9 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
     k.v_lshlrev_b32(tile_stride, 5, tile_stride);  // K * 32
 
     for t in 0..n_tiles {
-        k.global_load(wt_frags[t], wt_addr, Width::B128, 0);
-        k.global_load(VReg(wt_frags[t].0 + 4), wt_addr, Width::B128, 16);
+        for i in 0..frag_loads {
+            k.global_load(VReg(wt_frags[t].0 + i * 4), wt_addr, Width::B128, (i * 16) as i32);
+        }
         if t + 1 < n_tiles {
             k.v_add_co(wt_addr, wt_addr, tile_stride);
             k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
@@ -328,6 +337,7 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
 /// ```
 #[derive(Clone, Debug)]
 pub struct AutoGemmSchedule {
+    pub target: Target,
     pub tile_m: usize,
     pub tile_n: usize,
     pub tile_k: usize,
@@ -338,15 +348,15 @@ pub struct AutoGemmSchedule {
 }
 
 impl AutoGemmSchedule {
-    /// Auto-select optimal GEMM tile parameters for the given problem size.
-    /// Uses exhaustive search over the tile space.
-    pub fn for_problem(m: u32, n: u32, k: u32) -> Self {
+    /// Auto-select optimal GEMM tile parameters for the given problem size and target.
+    pub fn for_target(target: Target, m: u32, n: u32, k: u32) -> Self {
         use super::cost_model::{self, DataFormat};
 
-        let cost = cost_model::best_gemm_config(m, n, k, DataFormat::BF16)
+        let cost = cost_model::best_gemm_config_for_target(target, m, n, k, DataFormat::BF16)
             .expect("no feasible GEMM tile configuration found");
 
         let sched = AutoGemmSchedule {
+            target,
             tile_m: cost.config.tile_m as usize,
             tile_n: cost.config.tile_n as usize,
             tile_k: cost.config.tile_k as usize,
@@ -357,17 +367,43 @@ impl AutoGemmSchedule {
         };
 
         eprintln!(
-            "[AutoSchedule] M={} N={} K={} → tile={}×{}×{} waves={} {:.1}T ({}) VGPRs={}",
-            m, n, k, sched.tile_m, sched.tile_n, sched.tile_k,
-            sched.waves, sched.estimated_tflops, sched.bottleneck, cost.vgprs
+            "[AutoSchedule] {:?} M={} N={} K={} → tile={}×{}×{} waves={} {:.1}T ({}) VGPRs={}",
+            target,
+            m,
+            n,
+            k,
+            sched.tile_m,
+            sched.tile_n,
+            sched.tile_k,
+            sched.waves,
+            sched.estimated_tflops,
+            sched.bottleneck,
+            cost.vgprs
         );
 
         sched
     }
 
+    /// Auto-select optimal GEMM tile parameters for the given problem size.
+    /// Uses exhaustive search over the tile space.
+    pub fn for_problem(m: u32, n: u32, k: u32) -> Self {
+        Self::for_target(current_target(), m, n, k)
+    }
+
     /// Create from explicit tile parameters (for testing or override).
     pub fn with_tiles(tile_m: usize, tile_n: usize, tile_k: usize, waves: u32) -> Self {
+        Self::with_tiles_for_target(current_target(), tile_m, tile_n, tile_k, waves)
+    }
+
+    pub fn with_tiles_for_target(
+        target: Target,
+        tile_m: usize,
+        tile_n: usize,
+        tile_k: usize,
+        waves: u32,
+    ) -> Self {
         AutoGemmSchedule {
+            target,
             tile_m, tile_n, tile_k, waves,
             use_lds: false,
             estimated_tflops: 0.0,
@@ -377,7 +413,12 @@ impl AutoGemmSchedule {
 }
 
 impl Schedule for AutoGemmSchedule {
-    fn name(&self) -> &'static str { "GFX1100 (Auto)" }
+    fn name(&self) -> &'static str {
+        match self.target {
+            Target::GFX1100 => "GFX1100 (Auto)",
+            Target::GFX1201 => "GFX1201 (Auto)",
+        }
+    }
     fn gemm_tile_mn(&self) -> (usize, usize) { (self.tile_m, self.tile_n) }
     fn gemm_tile_k(&self) -> usize { self.tile_k }
     fn use_wmma(&self) -> bool { true }
@@ -393,7 +434,7 @@ impl Schedule for AutoGemmSchedule {
     }
     fn elems_per_thread(&self) -> usize { 4 }
     fn lds_budget(&self) -> u32 { 65536 }
-    fn target(&self) -> Target { Target::GFX1100 }
+    fn target(&self) -> Target { self.target }
 }
 
 /// One-call entry point: auto-select tiles → build GEMM kernel → return T0Kernel.
@@ -408,6 +449,11 @@ pub fn auto_build_gemm(m: u32, n: u32, k: u32) -> T0Kernel {
     build_gemm_forward(&sched)
 }
 
+pub fn auto_build_gemm_for_target(target: Target, m: u32, n: u32, k: u32) -> T0Kernel {
+    let sched = AutoGemmSchedule::for_target(target, m, n, k);
+    build_gemm_forward(&sched)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -415,6 +461,23 @@ pub fn auto_build_gemm(m: u32, n: u32, k: u32) -> T0Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Debug)]
+    struct GFX1201TestSchedule;
+
+    impl Schedule for GFX1201TestSchedule {
+        fn name(&self) -> &'static str { "GFX1201 test" }
+        fn gemm_tile_mn(&self) -> (usize, usize) { (32, 64) }
+        fn gemm_tile_k(&self) -> usize { 16 }
+        fn use_wmma(&self) -> bool { true }
+        fn wmma_format(&self) -> WmmaFormat { WmmaFormat::BF16_F32 }
+        fn a_load_strategy(&self) -> TileLoadStrategy { TileLoadStrategy::DirectGlobal }
+        fn b_load_strategy(&self) -> TileLoadStrategy { TileLoadStrategy::DirectGlobal }
+        fn workgroup_size(&self) -> (u16, u16, u16) { (64, 1, 1) }
+        fn elems_per_thread(&self) -> usize { 4 }
+        fn lds_budget(&self) -> u32 { 65536 }
+        fn target(&self) -> Target { Target::GFX1201 }
+    }
 
     #[test]
     fn test_gfx1100_schedule_params() {
@@ -439,7 +502,7 @@ mod tests {
         eprintln!("--- Elementwise scale (T0-mid) ---\n{}", asm);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_elementwise_scale_elf() {
         let sched = GFX1100Schedule;
@@ -461,7 +524,27 @@ mod tests {
         eprintln!("--- GEMM Forward (T0-mid) ---\n{}", asm);
     }
 
-    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_build_gemm_forward_gfx1201_wmma_operands() {
+        let sched = GFX1201TestSchedule;
+        let kernel = build_gemm_forward(&sched);
+        let asm = kernel.to_assembly(Target::GFX1201).unwrap();
+        let wmma_line = asm.lines()
+            .find(|line| line.contains("v_wmma_f32_16x16x16_bf16"))
+            .expect("missing WMMA instruction");
+        let spans: Vec<u32> = wmma_line
+            .split("v[")
+            .skip(1)
+            .map(|part| {
+                let regs = part.split(']').next().expect("unterminated register range");
+                let (lo, hi) = regs.split_once(':').expect("expected register range");
+                hi.parse::<u32>().unwrap() - lo.parse::<u32>().unwrap() + 1
+            })
+            .collect();
+        assert_eq!(spans, vec![8, 4, 4, 8], "unexpected GFX1201 WMMA operand widths");
+    }
+
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_gemm_forward_elf() {
         let sched = GFX1100Schedule;
@@ -517,7 +600,7 @@ mod tests {
             manual_asm.lines().count(), auto_asm.lines().count());
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_auto_build_gemm_elf() {
         let kernel = auto_build_gemm(4096, 4096, 512);
@@ -527,4 +610,3 @@ mod tests {
         eprintln!("Auto GEMM ELF: {} bytes", elf.len());
     }
 }
-

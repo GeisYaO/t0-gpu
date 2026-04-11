@@ -12,7 +12,7 @@
 //!
 //! let spec = TileGemm::tile_128x64_k16();
 //! let kernel = lower_gemm(&spec);
-//! let elf = kernel.compile(Target::GFX1100).unwrap();
+//! let elf = kernel.compile(Target::GFX1201).unwrap();
 //! ```
 
 use super::compile::T0Kernel;
@@ -583,6 +583,15 @@ pub fn tile_auto_select(m: u32, k: u32, n: u32, transpose: TileTranspose) -> Til
 /// The generated kernel is functionally equivalent to `gemm_gen::generate()`
 /// but produced by the compiler from a parametric specification.
 pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
+    let target = current_target();
+    let wmma_format = WmmaFormat::BF16_F32;
+    let frag_a_vgprs = wmma_format.a_vreg_count(target);
+    let frag_b_vgprs = wmma_format.b_vreg_count(target);
+    let frag_a_align = wmma_format.a_alignment(target);
+    let frag_b_align = wmma_format.b_alignment(target);
+    let frag_a_loads = frag_a_vgprs / 4;
+    let frag_b_loads = frag_b_vgprs / 4;
+
     let n_col_tiles = spec.n_col_tiles() as usize;
     let n_row_blocks = spec.n_row_blocks() as usize;
     let rows_per_wave = spec.rows_per_wave();
@@ -591,7 +600,7 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     let lds_wt = spec.lds_wt_size();
     let lds_buf = lds_x + lds_wt;  // per buffer
 
-    // Safety: GFX1100 CWSR limits LDS save area to 64KB per CU.
+    // Safety: GFX1201 CWSR limits LDS save area to 64KB per CU.
     // WGP mode with LDS > 64KB causes queue eviction → hard hang.
     // Auto-fallback to CU mode when LDS exceeds limit.
     let effective_wgp = if spec.wgp_mode && spec.lds_total() > 65536 {
@@ -1071,11 +1080,13 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
         let xr_0 = k.alloc_vreg();
         k.v_xor_b32(xr_0, Operand::VReg(x_lds_reads_raw[r]), Operand::VReg(lane_swizzle));
         x_lds_reads_0.push(xr_0);
-        let xr_16_base = k.alloc_vreg();
-        k.push(Op::VAddU32 { dst: xr_16_base, src0: Operand::VReg(x_lds_reads_raw[r]), src1: Operand::InlineInt(16) });
-        let xr_16 = k.alloc_vreg();
-        k.v_xor_b32(xr_16, Operand::VReg(xr_16_base), Operand::VReg(lane_swizzle));
-        x_lds_reads_16.push(xr_16);
+        if frag_a_loads > 1 {
+            let xr_16_base = k.alloc_vreg();
+            k.push(Op::VAddU32 { dst: xr_16_base, src0: Operand::VReg(x_lds_reads_raw[r]), src1: Operand::InlineInt(16) });
+            let xr_16 = k.alloc_vreg();
+            k.v_xor_b32(xr_16, Operand::VReg(xr_16_base), Operand::VReg(lane_swizzle));
+            x_lds_reads_16.push(xr_16);
+        }
     }
 
     // ── WT LDS read addresses: save raw for per-ksub recomputation ──
@@ -1084,10 +1095,15 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     // Pre-XOR'd for ksub=0
     let wt_lds_read_base_0 = k.alloc_vreg();
     k.v_xor_b32(wt_lds_read_base_0, Operand::VReg(wt_lds_read_raw), Operand::VReg(lane_swizzle));
-    let wt_lds_16_base = k.alloc_vreg();
-    k.push(Op::VAddU32 { dst: wt_lds_16_base, src0: Operand::VReg(wt_lds_read_raw), src1: Operand::InlineInt(16) });
-    let wt_lds_read_base_16 = k.alloc_vreg();
-    k.v_xor_b32(wt_lds_read_base_16, Operand::VReg(wt_lds_16_base), Operand::VReg(lane_swizzle));
+    let wt_lds_read_base_16 = if frag_b_loads > 1 {
+        let wt_lds_16_base = k.alloc_vreg();
+        k.push(Op::VAddU32 { dst: wt_lds_16_base, src0: Operand::VReg(wt_lds_read_raw), src1: Operand::InlineInt(16) });
+        let wt_lds_read_base_16 = k.alloc_vreg();
+        k.v_xor_b32(wt_lds_read_base_16, Operand::VReg(wt_lds_16_base), Operand::VReg(lane_swizzle));
+        wt_lds_read_base_16
+    } else {
+        VReg(0)
+    };
 
     // ── GMEM register set — sized for batch, not full tile_k ──
     // For k<=32: batch = full loads (e.g., 4 loads for k32).
@@ -1120,20 +1136,20 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     // Column-major (n_row_blocks frag_a) is the optimal tradeoff at 200 VGPRs.
     let frag_a_count = if spec.acc_swap { 1 } else { n_row_blocks };
     let frag_a: Vec<VReg> = (0..frag_a_count)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .map(|_| k.alloc_vreg_array(frag_a_vgprs, frag_a_align))
         .collect();
     // Streaming mode (n_col_tiles > 4) only needs 1 ping-pong pair = 16 VGPRs.
     // Bulk-load mode needs all n_col_tiles fragments = n_col_tiles * 8 VGPRs.
     // Fix: don't allocate 8 × 8 = 64 VGPRs when only 2 × 8 = 16 are needed!
     let use_streaming = n_col_tiles > 4;
     let frag_b: Vec<VReg> = if use_streaming {
-        vec![k.alloc_vreg_array(8, Alignment::Align8)]  // only ping buffer
+        vec![k.alloc_vreg_array(frag_b_vgprs, frag_b_align)]  // only ping buffer
     } else {
-        (0..n_col_tiles).map(|_| k.alloc_vreg_array(8, Alignment::Align8)).collect()
+        (0..n_col_tiles).map(|_| k.alloc_vreg_array(frag_b_vgprs, frag_b_align)).collect()
     };
     // Pong buffer for streaming (or dummy for bulk-load)
     let frag_b_shared = if use_streaming {
-        k.alloc_vreg_array(8, Alignment::Align8)
+        k.alloc_vreg_array(frag_b_vgprs, frag_b_align)
     } else {
         VReg(0) // unused in bulk-load mode
     };
@@ -1872,6 +1888,10 @@ fn emit_lds_read_and_wmma(
     frag_b_shared: VReg,
     store_schedule: Option<&StoreSchedule>,
 ) {
+    let target = current_target();
+    let wmma_format = WmmaFormat::BF16_F32;
+    let frag_a_loads = wmma_format.a_vreg_count(target) / 4;
+    let frag_b_loads = wmma_format.b_vreg_count(target) / 4;
     let k_sub = spec.k_sub_steps();
     // Use column-streaming for large tiles (>4 cols) to reduce VGPR pressure.
     // Small tiles (≤4 cols) use bulk-load for better LDS-WMMA overlap.
@@ -1888,9 +1908,13 @@ fn emit_lds_read_and_wmma(
     let (xr_0_tmp, xr_16_tmp, wt_0_tmp, wt_16_tmp) = if k_sub > 1 {
         (
             (0..n_row_blocks).map(|_| k.alloc_vreg()).collect::<Vec<_>>(),
-            (0..n_row_blocks).map(|_| k.alloc_vreg()).collect::<Vec<_>>(),
+            if frag_a_loads > 1 {
+                (0..n_row_blocks).map(|_| k.alloc_vreg()).collect::<Vec<_>>()
+            } else {
+                vec![]
+            },
             k.alloc_vreg(),
-            k.alloc_vreg(),
+            if frag_b_loads > 1 { k.alloc_vreg() } else { VReg(0) },
         )
     } else {
         (vec![], vec![], VReg(0), VReg(0)) // unused
@@ -1926,11 +1950,13 @@ fn emit_lds_read_and_wmma(
                     src1: Operand::InlineInt(k_byte_within as i32),
                 });
                 k.v_xor_b32(xr_0_tmp[r], Operand::VReg(xr_0_tmp[r]), Operand::VReg(lane_swizzle));
-                k.push(Op::VAddU32 {
-                    dst: xr_16_tmp[r], src0: Operand::VReg(x_lds_reads_raw[r]),
-                    src1: Operand::InlineInt(k_byte_within as i32 + 16),
-                });
-                k.v_xor_b32(xr_16_tmp[r], Operand::VReg(xr_16_tmp[r]), Operand::VReg(lane_swizzle));
+                if frag_a_loads > 1 {
+                    k.push(Op::VAddU32 {
+                        dst: xr_16_tmp[r], src0: Operand::VReg(x_lds_reads_raw[r]),
+                        src1: Operand::InlineInt(k_byte_within as i32 + 16),
+                    });
+                    k.v_xor_b32(xr_16_tmp[r], Operand::VReg(xr_16_tmp[r]), Operand::VReg(lane_swizzle));
+                }
             }
             // Recompute WT read addresses
             {
@@ -1939,11 +1965,13 @@ fn emit_lds_read_and_wmma(
                     src1: Operand::InlineInt(k_byte_within as i32),
                 });
                 k.v_xor_b32(wt_0_tmp, Operand::VReg(wt_0_tmp), Operand::VReg(lane_swizzle));
-                k.push(Op::VAddU32 {
-                    dst: wt_16_tmp, src0: Operand::VReg(wt_raw),
-                    src1: Operand::InlineInt(k_byte_within as i32 + 16),
-                });
-                k.v_xor_b32(wt_16_tmp, Operand::VReg(wt_16_tmp), Operand::VReg(lane_swizzle));
+                if frag_b_loads > 1 {
+                    k.push(Op::VAddU32 {
+                        dst: wt_16_tmp, src0: Operand::VReg(wt_raw),
+                        src1: Operand::InlineInt(k_byte_within as i32 + 16),
+                    });
+                    k.v_xor_b32(wt_16_tmp, Operand::VReg(wt_16_tmp), Operand::VReg(lane_swizzle));
+                }
             }
             cur_x_reads_0 = &xr_0_tmp;
             cur_x_reads_16 = &xr_16_tmp;
@@ -1962,7 +1990,9 @@ fn emit_lds_read_and_wmma(
         if !frag_a_preloaded && !row_major {
             for r in 0..frag_a.len() {
                 k.ds_load_b128(frag_a[r], cur_x_reads_0[r], ds_off);
-                k.ds_load_b128(VReg(frag_a[r].0 + 4), cur_x_reads_16[r], ds_off);
+                if frag_a_loads > 1 {
+                    k.ds_load_b128(VReg(frag_a[r].0 + 4), cur_x_reads_16[r], ds_off);
+                }
             }
         }
 
@@ -1983,22 +2013,28 @@ fn emit_lds_read_and_wmma(
                 for r in 0..n_row_blocks {
                     // Load frag_a for this row block
                     k.ds_load_b128(frag_a[0], cur_x_reads_0[r], ds_off);
-                    k.ds_load_b128(VReg(frag_a[0].0 + 4), cur_x_reads_16[r], ds_off);
+                    if frag_a_loads > 1 {
+                        k.ds_load_b128(VReg(frag_a[0].0 + 4), cur_x_reads_16[r], ds_off);
+                    }
 
                     // Prefetch first TWO B columns
                     {
                         let base_0: u16 = lds_x as u16;
                         k.ds_load_b128(fb_ping, cur_wt_0, base_0 + ds_off);
-                        k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
+                        if frag_b_loads > 1 {
+                            k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
+                        }
                     }
                     if n_col_tiles > 1 {
                         let base_1: u16 = (lds_x + 16 * wt_row_stride) as u16;
                         k.ds_load_b128(fb_pong, cur_wt_0, base_1 + ds_off);
-                        k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
+                        if frag_b_loads > 1 {
+                            k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
+                        }
                     }
 
-                    // Wait: 2 frag_a + 2 frag_b_col1 in flight, need frag_a + col0 ready
-                    let initial_wait = if n_col_tiles > 1 { 2u8 } else { 0u8 };
+                    // Keep only the next B column in flight.
+                    let initial_wait = if n_col_tiles > 1 { frag_b_loads as u8 } else { 0u8 };
                     k.wait_lgkmcnt(initial_wait);
 
                     for c in 0..n_col_tiles {
@@ -2020,12 +2056,14 @@ fn emit_lds_read_and_wmma(
                         if c + 2 < n_col_tiles {
                             let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
                             k.ds_load_b128(cur_fb, cur_wt_0, next2_base + ds_off);
-                            k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
+                            if frag_b_loads > 1 {
+                                k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
+                            }
                         }
 
                         // Wait for next column's B data
                         if c + 1 < n_col_tiles {
-                            let remaining = if c + 2 < n_col_tiles { 2u8 } else { 0u8 };
+                            let remaining = if c + 2 < n_col_tiles { frag_b_loads as u8 } else { 0u8 };
                             k.wait_lgkmcnt(remaining);
                         }
                     }
@@ -2039,18 +2077,24 @@ fn emit_lds_read_and_wmma(
                 {
                     let base_0: u16 = lds_x as u16;
                     k.ds_load_b128(fb_ping, cur_wt_0, base_0 + ds_off);
-                    k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
+                    if frag_b_loads > 1 {
+                        k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
+                    }
                 }
                 if n_col_tiles > 1 {
                     let base_1: u16 = (lds_x + 16 * wt_row_stride) as u16;
                     k.ds_load_b128(fb_pong, cur_wt_0, base_1 + ds_off);
-                    k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
+                    if frag_b_loads > 1 {
+                        k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
+                    }
                 }
 
                 // When frag_a was preloaded, it has a head start — account for
                 // those 4 loads still in the lgkmcnt pipeline.
-                let preloaded_inflight = if frag_a_preloaded { (2 * n_row_blocks) as u8 } else { 0u8 };
-                let initial_wait = if n_col_tiles > 1 { 2u8 + preloaded_inflight } else { preloaded_inflight };
+                let preloaded_inflight =
+                    if frag_a_preloaded { (frag_a_loads as usize * n_row_blocks) as u8 } else { 0u8 };
+                let initial_wait =
+                    if n_col_tiles > 1 { frag_b_loads as u8 + preloaded_inflight } else { preloaded_inflight };
                 k.wait_lgkmcnt(initial_wait);
 
                 for c in 0..n_col_tiles {
@@ -2075,17 +2119,19 @@ fn emit_lds_read_and_wmma(
                                 });
                                 let nxr_0 = k.alloc_vreg();
                                 k.v_xor_b32(nxr_0, Operand::VReg(ntmp), Operand::VReg(lane_swizzle));
-                                let ntmp16 = k.alloc_vreg();
-                                k.push(Op::VAddU32 {
-                                    dst: ntmp16, src0: Operand::VReg(x_lds_reads_raw[r2]),
-                                    src1: Operand::InlineInt(next_k_byte + 16),
-                                });
-                                let nxr_16 = k.alloc_vreg();
-                                k.v_xor_b32(nxr_16, Operand::VReg(ntmp16), Operand::VReg(lane_swizzle));
                                 // Note: these regs are used by next ksub's cur_x_reads
                                 // but since prefetch uses frag_a[r] as dest, they're temporary
                                 k.ds_load_b128(frag_a[r2], nxr_0, buf_off);
-                                k.ds_load_b128(VReg(frag_a[r2].0 + 4), nxr_16, buf_off);
+                                if frag_a_loads > 1 {
+                                    let ntmp16 = k.alloc_vreg();
+                                    k.push(Op::VAddU32 {
+                                        dst: ntmp16, src0: Operand::VReg(x_lds_reads_raw[r2]),
+                                        src1: Operand::InlineInt(next_k_byte + 16),
+                                    });
+                                    let nxr_16 = k.alloc_vreg();
+                                    k.v_xor_b32(nxr_16, Operand::VReg(ntmp16), Operand::VReg(lane_swizzle));
+                                    k.ds_load_b128(VReg(frag_a[r2].0 + 4), nxr_16, buf_off);
+                                }
                             }
                         }
 
@@ -2103,12 +2149,14 @@ fn emit_lds_read_and_wmma(
                     if c + 2 < n_col_tiles {
                         let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
                         k.ds_load_b128(cur_fb, cur_wt_0, next2_base + ds_off);
-                        k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
+                        if frag_b_loads > 1 {
+                            k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
+                        }
                     }
 
                     // Wait for next column's B data
                     if c + 1 < n_col_tiles {
-                        let mut remaining = if c + 2 < n_col_tiles { 2u8 } else { 0u8 };
+                        let mut remaining = if c + 2 < n_col_tiles { frag_b_loads as u8 } else { 0u8 };
                         if c == n_col_tiles - 2 && ksub + 1 < k_sub {
                             // frag_a prefetches not yet issued, remaining stays same
                         }
@@ -2140,13 +2188,16 @@ fn emit_lds_read_and_wmma(
             for c in 0..n_col_tiles {
                 let base_off: u16 = (lds_x + (c as u32) * 16 * wt_row_stride) as u16;
                 k.ds_load_b128(frag_b[c], cur_wt_0, base_off + ds_off);
-                k.ds_load_b128(VReg(frag_b[c].0 + 4), cur_wt_16, base_off + ds_off);
+                if frag_b_loads > 1 {
+                    k.ds_load_b128(VReg(frag_b[c].0 + 4), cur_wt_16, base_off + ds_off);
+                }
             }
 
-            let total_loads = (2 * n_row_blocks + 2 * n_col_tiles) as u8;
+            let total_loads = (frag_a_loads as usize * n_row_blocks + frag_b_loads as usize * n_col_tiles) as u8;
             let mut pending_stores: u8 = 0;
             for c in 0..n_col_tiles {
-                let loads_needed = (2 * n_row_blocks + 2 * c + 2) as u8;
+                let loads_needed =
+                    (frag_a_loads as usize * n_row_blocks + frag_b_loads as usize * (c + 1)) as u8;
                 // Account for ds_stores already in lgkmcnt pipeline
                 let remaining = total_loads.saturating_sub(loads_needed) + pending_stores;
                 k.wait_lgkmcnt(remaining);
@@ -2693,6 +2744,10 @@ fn emit_lds_read_and_wmma_swap(
     swap_addr: VReg,       // LDS swap address
     swap_temp: VReg,       // 8-VGPR temp for acc swap (dedicated, not frag_b)
 ) {
+    let target = current_target();
+    let wmma_format = WmmaFormat::BF16_F32;
+    let frag_a_loads = wmma_format.a_vreg_count(target) / 4;
+    let frag_b_loads = wmma_format.b_vreg_count(target) / 4;
     let k_sub_steps = (spec.tile_k / 16) as usize;
 
     for r in 0..n_row_blocks {
@@ -2701,7 +2756,9 @@ fn emit_lds_read_and_wmma_swap(
 
             // ── Load A fragment for row_block r ──
             k.ds_load_b128(frag_a[0], x_lds_reads_0[r], buf_off + k_byte_within);
-            k.ds_load_b128(VReg(frag_a[0].0 + 4), x_lds_reads_16[r], buf_off + k_byte_within);
+            if frag_a_loads > 1 {
+                k.ds_load_b128(VReg(frag_a[0].0 + 4), x_lds_reads_16[r], buf_off + k_byte_within);
+            }
 
             // ── Streaming B columns (same as original streaming mode) ──
             let fb_ping = frag_b[0];
@@ -2710,15 +2767,19 @@ fn emit_lds_read_and_wmma_swap(
             // Prefetch B[0] and B[1]
             let base0: u16 = (lds_x as u16) + (0u16) * (16 * wt_row_stride as u16);
             k.ds_load_b128(fb_ping, wt_base_0, base0 + buf_off + k_byte_within);
-            k.ds_load_b128(VReg(fb_ping.0 + 4), wt_base_16, base0 + buf_off + k_byte_within);
+            if frag_b_loads > 1 {
+                k.ds_load_b128(VReg(fb_ping.0 + 4), wt_base_16, base0 + buf_off + k_byte_within);
+            }
             if n_col_tiles > 1 {
                 let base1: u16 = (lds_x as u16) + (1u16) * (16 * wt_row_stride as u16);
                 k.ds_load_b128(fb_pong, wt_base_0, base1 + buf_off + k_byte_within);
-                k.ds_load_b128(VReg(fb_pong.0 + 4), wt_base_16, base1 + buf_off + k_byte_within);
+                if frag_b_loads > 1 {
+                    k.ds_load_b128(VReg(fb_pong.0 + 4), wt_base_16, base1 + buf_off + k_byte_within);
+                }
             }
 
             // Wait for A + B[0] (keep B[1] in flight if present)
-            let initial_wait = if n_col_tiles > 1 { 2u8 } else { 0u8 };
+            let initial_wait = if n_col_tiles > 1 { frag_b_loads as u8 } else { 0u8 };
             k.wait_lgkmcnt(initial_wait);
 
             for c in 0..n_col_tiles {
@@ -2731,12 +2792,14 @@ fn emit_lds_read_and_wmma_swap(
                 if c + 2 < n_col_tiles {
                     let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
                     k.ds_load_b128(cur_fb, wt_base_0, next2_base + buf_off + k_byte_within);
-                    k.ds_load_b128(VReg(cur_fb.0 + 4), wt_base_16, next2_base + buf_off + k_byte_within);
+                    if frag_b_loads > 1 {
+                        k.ds_load_b128(VReg(cur_fb.0 + 4), wt_base_16, next2_base + buf_off + k_byte_within);
+                    }
                 }
 
                 // Wait for next column's B data
                 if c + 1 < n_col_tiles {
-                    let remaining = if c + 2 < n_col_tiles { 2u8 } else { 0u8 };
+                    let remaining = if c + 2 < n_col_tiles { frag_b_loads as u8 } else { 0u8 };
                     k.wait_lgkmcnt(remaining);
                 }
             }
@@ -2897,8 +2960,8 @@ mod tests {
     fn test_lower_gemm_compiles() {
         // Core test: lower_gemm produces a kernel that compiles to ELF
         let spec = TileGemm::tile_128x64_k16();
-        let kernel = lower_gemm(&spec);
-        let result = kernel.compile(Target::GFX1100);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
+        let result = kernel.compile(Target::GFX1201);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         let elf = result.unwrap();
         assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
@@ -2908,8 +2971,8 @@ mod tests {
     #[test]
     fn test_lower_gemm_64x64_compiles() {
         let spec = TileGemm::tile_64x64_k16();
-        let kernel = lower_gemm(&spec);
-        let result = kernel.compile(Target::GFX1100);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
+        let result = kernel.compile(Target::GFX1201);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         eprintln!("[tile_ir] {} → {} bytes ELF", spec.name(), result.unwrap().len());
     }
@@ -2917,8 +2980,8 @@ mod tests {
     #[test]
     fn test_lower_gemm_32x64_compiles() {
         let spec = TileGemm::tile_32x64_k16();
-        let kernel = lower_gemm(&spec);
-        let result = kernel.compile(Target::GFX1100);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
+        let result = kernel.compile(Target::GFX1201);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         eprintln!("[tile_ir] {} → {} bytes ELF", spec.name(), result.unwrap().len());
     }
@@ -2929,8 +2992,8 @@ mod tests {
         eprintln!("[tile_ir] {} LDS total: {} bytes (gemm={}, swap={})",
             spec.name(), spec.lds_total(),
             spec.lds_per_buffer() * 2, spec.acc_swap_region_size());
-        let kernel = lower_gemm(&spec);
-        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1100)
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
+        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1201)
             .expect("compile failed for swap config");
         assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
         eprintln!("[tile_ir] {} → {} bytes ELF, final_lds={}", spec.name(), elf.len(), final_lds);
@@ -2943,7 +3006,7 @@ mod tests {
         // Compile-only test for k32 standard (no swap).
         let spec = TileGemm::tile_128x128_k32();
         eprintln!("[tile_ir] compiling k32 standard: {}", spec.name());
-        let kernel = lower_gemm(&spec);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
 
         // ── K-loop instruction analysis ──
         let ops = kernel.ops();
@@ -2988,7 +3051,7 @@ mod tests {
             eprintln!("╚══════════════════════════════════════════════════════╝");
         }
 
-        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1100)
+        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1201)
             .expect("compile failed for k32 standard");
         assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
         eprintln!("[tile_ir] {} → {} bytes ELF, final_lds={}", spec.name(), elf.len(), final_lds);
@@ -2996,40 +3059,67 @@ mod tests {
         // ── k48 compile disabled (panics: k48 is not power-of-2) ──
         // let spec48 = TileGemm::tile_128x128_k48();
         // let kernel48 = lower_gemm(&spec48);
-        // let (elf48, lds48) = kernel48.compile_with_info(Target::GFX1100)
+        // let (elf48, lds48) = kernel48.compile_with_info(Target::GFX1201)
         //     .expect("compile failed for k48");
 
         // ── k64 configs (VGPR exploration) ──
         // 128×128 k64: may spill (GMEM=64 VGPRs)
         let spec64 = TileGemm::tile_128x128_k64();
         eprintln!("\n[tile_ir] compiling 128x128 k64: {} (LDS={})", spec64.name(), spec64.lds_total());
-        let kernel64 = lower_gemm(&spec64);
-        let _ = kernel64.compile_with_info(Target::GFX1100);  // may fail, that's OK
+        let kernel64 = with_target_context(Target::GFX1201, || lower_gemm(&spec64));
+        let _ = kernel64.compile_with_info(Target::GFX1201);  // may fail, that's OK
 
         // 128×64 k64: should fit (ACC=64, GMEM=48)
         let spec64s = TileGemm::tile_128x64_k64();
         eprintln!("\n[tile_ir] compiling 128x64 k64: {} (LDS={})", spec64s.name(), spec64s.lds_total());
-        let kernel64s = lower_gemm(&spec64s);
-        let _ = kernel64s.compile_with_info(Target::GFX1100);
+        let kernel64s = with_target_context(Target::GFX1201, || lower_gemm(&spec64s));
+        let _ = kernel64s.compile_with_info(Target::GFX1201);
 
         // 256×64 k64 WGP: predicted ~166 VGPRs → 4 waves!
         let spec_wgp = TileGemm::tile_256x64_k64_wgp();
         eprintln!("\n[tile_ir] compiling 256x64 k64 WGP: {} (LDS={})", spec_wgp.name(), spec_wgp.lds_total());
-        let kernel_wgp = lower_gemm(&spec_wgp);
-        let _ = kernel_wgp.compile_with_info(Target::GFX1100);
+        let kernel_wgp = with_target_context(Target::GFX1201, || lower_gemm(&spec_wgp));
+        let _ = kernel_wgp.compile_with_info(Target::GFX1201);
     }
 
     #[test]
-    #[cfg(feature = "rocm")]
+    fn test_lower_gemm_64x128_k64_really_spills_on_gfx1201() {
+        let spec = TileGemm {
+            tile_m: 64,
+            tile_n: 128,
+            tile_k: 64,
+            wgp_mode: false,
+            double_buffer: true,
+            split_k: 1,
+            swap_grid: true,
+            transpose: TileTranspose::NT,
+            acc_swap: false,
+            epilogue: vec![],
+        };
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
+        let base_lds = kernel.lds_size();
+        let (_elf, final_lds) = kernel.compile_with_info(Target::GFX1201)
+            .expect("compile failed for 64x128 k64");
+        assert!(
+            final_lds > base_lds,
+            "expected real spill-backed LDS growth for {}, base={} final={}",
+            spec.name(),
+            base_lds,
+            final_lds,
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_lower_gemm_128x128_swap_correctness() {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{DispatchPool, GpuDevice, GpuKernel, KernelLoadConfig};
 
         let spec = TileGemm::tile_128x128_k16_swap();
         let kernel = lower_gemm(&spec);
-        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1100)
+        let (elf, final_lds) = kernel.compile_with_info(Target::GFX1201)
             .expect("compile failed");
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -3151,6 +3241,9 @@ pub fn build_kernargs(
     spec: &TileGemm,
 ) -> Vec<u8> {
     let sk_shift: u32 = match spec.split_k { 1=>0, 2=>1, 4=>2, 8=>3, 16=>4, _=>0 };
+    if spec.split_k > 1 {
+        panic!("build_kernargs() requires explicit M for split_k>1; use build_kernargs_m()");
+    }
     // For split-K: each partition writes to y_addr + partition_id * y_split_stride
     // y_split_stride = M * N * 4 bytes (full output matrix per partition)
     // For sk=1: unused, set to 0
@@ -3176,7 +3269,14 @@ pub fn build_kernargs_m(
     spec: &TileGemm,
 ) -> Vec<u8> {
     let sk_shift: u32 = match spec.split_k { 1=>0, 2=>1, 4=>2, 8=>3, 16=>4, _=>0 };
-    let y_split_stride: u32 = 0;
+    let y_split_stride: u32 = if spec.split_k > 1 {
+        m_dim
+            .checked_mul(n_dim)
+            .and_then(|v| v.checked_mul(4))
+            .expect("y_split_stride overflow for split_k kernel")
+    } else {
+        0
+    };
     let mut ka = Vec::with_capacity(48);
     ka.extend_from_slice(&x_addr.to_le_bytes());     // arg 0: X ptr
     ka.extend_from_slice(&wt_addr.to_le_bytes());    // arg 1: WT ptr
@@ -3267,7 +3367,7 @@ mod compile_tests {
             };
 
             // Compile to ELF to get regalloc info
-            match t0k.compile(Target::GFX1100) {
+            match t0k.compile(Target::GFX1201) {
                 Ok(elf) => {
                     eprintln!("{:<15} {:<28} {:>8} {:>8} {:>8} {:>10} {}  grid={:?}",
                         format!("{}×{}×{}", m, k, n),
@@ -3316,13 +3416,13 @@ mod compile_tests {
         // ── A: compile WITH T0_SKIP_WAITOPT (baseline, current production) ──
         std::env::set_var("T0_SKIP_WAITOPT", "1");
         let kernel_a = lower_gemm(&spec);
-        let asm_a = kernel_a.to_assembly(Target::GFX1100).expect("compile A");
+        let asm_a = kernel_a.to_assembly(Target::GFX1201).expect("compile A");
 
         // ── B: compile WITHOUT T0_SKIP_WAITOPT (new, with BufferLoad fix) ──
         std::env::remove_var("T0_SKIP_WAITOPT");
         // Must create a fresh kernel so env var takes effect at compile time
         let kernel_b = lower_gemm(&spec);
-        let asm_b = kernel_b.to_assembly(Target::GFX1100).expect("compile B");
+        let asm_b = kernel_b.to_assembly(Target::GFX1201).expect("compile B");
 
         // Re-enable skip for other tests
         std::env::set_var("T0_SKIP_WAITOPT", "1");
@@ -3426,7 +3526,7 @@ mod compile_tests {
             eprintln!("  x_loads/thread={}, wt_loads/thread={}", x_loads, wt_loads);
 
             // Compile
-            match t0k.compile(Target::GFX1100) {
+            match t0k.compile(Target::GFX1201) {
                 Ok(_) => eprintln!("  ✅ compile OK"),
                 Err(e) => eprintln!("  ❌ compile FAILED: {}", e),
             }
@@ -3456,7 +3556,7 @@ mod compile_tests {
         for &(m, k, n) in &sizes {
             let cfg = gemm_gen::auto_select(m, k, n);
             let t0k = gemm_gen::generate(&cfg);
-            match t0k.compile(Target::GFX1100) {
+            match t0k.compile(Target::GFX1201) {
                 Ok(_) => {
                     let (gx, gy) = gemm_gen::compute_grid_auto(&cfg, m, n);
                     eprintln!("{:<15} {:<25} ✅ grid=[{},{},1]",
@@ -3474,7 +3574,7 @@ mod compile_tests {
 // GPU correctness tests
 // ============================================================================
 
-#[cfg(all(test, feature = "rocm"))]
+#[cfg(all(test, any(feature = "rocm", feature = "wsl_dxg")))]
 mod gpu_tests {
     use super::*;
     use crate::ignis::gpu_context::GpuRuntime;
@@ -3497,7 +3597,7 @@ mod gpu_tests {
     }
 
     /// Upload bf16 data to GPU. Returns GpuBuffer.
-    fn upload_bf16(rt: &GpuRuntime, data: &[u16]) -> crate::kfd::GpuBuffer {
+    fn upload_bf16(rt: &GpuRuntime, data: &[u16]) -> crate::gpu_backend::GpuBuffer {
         let n_bytes = ((data.len() * 2).max(512) + 511) & !511;
         let buf = rt.alloc(n_bytes).expect("alloc bf16");
         let bytes = unsafe {
@@ -3750,7 +3850,7 @@ mod gpu_tests {
             let iters = 10u32;
 
             eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
-            eprintln!("║  tile_ir Benchmark — RX 7900 XTX (GFX1100)                  ║");
+            eprintln!("║  tile_ir Benchmark — RX 7900 XTX (GFX1201)                  ║");
             eprintln!("║  BF16 WMMA GEMM, F32 output, CPU reference verified         ║");
             eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
             eprintln!("{:<20} {:>8} {:>10} {:>10} {:>12}",
@@ -3842,7 +3942,7 @@ mod gpu_tests {
 
             eprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
             eprintln!("║  tile_k Benchmark — k16 (128×128) vs k32 (128×64) + k16 (128×128)       ║");
-            eprintln!("║  RX 7900 XTX (GFX1100), BF16 WMMA GEMM, F32 output                     ║");
+            eprintln!("║  RX 7900 XTX (GFX1201), BF16 WMMA GEMM, F32 output                     ║");
             eprintln!("╚══════════════════════════════════════════════════════════════════════════╝\n");
             eprintln!("{:<20} {:>10} {:>10} {:>10} {:>10} {:>8}",
                 "Size", "k16 μs", "k16 TF", "k32 μs", "k32 TF", "Speedup");
@@ -3967,9 +4067,17 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn test_wgp_k64_benchmark() {
-        use std::time::Instant;
-
         with_rt(|rt| {
+            #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+            {
+                if !matches!(rt.device.target(), Target::GFX1201) {
+                    eprintln!(
+                        "\n[tile_ir] WARN: running test_wgp_k64_benchmark on non-GFX1201 target in wsl_dxg path (current: {:?})",
+                        rt.device.target()
+                    );
+                }
+            }
+
             let m = 4096u32; let k = 4096u32; let n = 4096u32;
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
             let warmup = 10u32;
@@ -3981,7 +4089,7 @@ mod gpu_tests {
             let wt_buf = upload_bf16(rt, &wt_bf16);
 
             eprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
-            eprintln!("║  WGP k64 Benchmark — 4096³ GEMM, RX 7900 XTX (GFX1100)                ║");
+            eprintln!("║  WGP k64 Benchmark — 4096³ GEMM, target={:?}                          ║", rt.device.target());
             eprintln!("╚══════════════════════════════════════════════════════════════════════════╝\n");
 
             let configs: Vec<(&str, TileGemm)> = vec![
@@ -3998,6 +4106,9 @@ mod gpu_tests {
                     s
                 }),
             ];
+            let asm_dump_only = std::env::var_os("T0_DUMP_ASM").is_some();
+            let mut any_success = false;
+            let mut failures: Vec<String> = Vec::new();
 
             for (label, spec) in &configs {
                 let y_buf = rt.alloc_zero((m * n * 4) as usize).expect("alloc Y");
@@ -4015,20 +4126,105 @@ mod gpu_tests {
                 );
                 let grid = compute_grid(spec, m, n);
 
-                for _ in 0..warmup {
-                    let _ = rt.dispatch(&kernel, grid, &ka);
+                if asm_dump_only {
+                    eprintln!(
+                        "  {:<20} SKIP: T0_DUMP_ASM=1 (ASM dump only mode, no GPU dispatch)",
+                        label
+                    );
+                    continue;
                 }
 
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    rt.dispatch_async(&kernel, grid, &ka);
+                let mut warmup_ok = true;
+                for _ in 0..warmup {
+                    if let Err(e) = rt.dispatch(&kernel, grid, &ka) {
+                        eprintln!("  {:<20} FAIL(warmup): {}", label, e);
+                        failures.push(format!("{} warmup: {}", label, e));
+                        warmup_ok = false;
+                        break;
+                    }
                 }
-                rt.wait_idle();
-                let us = t0.elapsed().as_micros() as f64 / iters as f64;
+                if !warmup_ok {
+                    continue;
+                }
+
+                // Correctness probe (sampled): report mismatch, but do not gate throughput output.
+                if let Err(e) = rt.dispatch(&kernel, grid, &ka) {
+                    eprintln!("  {:<20} FAIL(correctness-dispatch): {}", label, e);
+                    failures.push(format!("{} correctness-dispatch: {}", label, e));
+                    continue;
+                }
+                let mut y_bytes = vec![0u8; (m * n * 4) as usize];
+                y_buf.read(&mut y_bytes);
+                let sample_rows = [0usize, (m as usize) / 3, (m as usize) * 2 / 3, (m as usize) - 1];
+                let sample_cols = [0usize, (n as usize) / 3, (n as usize) * 2 / 3, (n as usize) - 1];
+                let mut bad = 0usize;
+                for &ri in &sample_rows {
+                    for &cj in &sample_cols {
+                        let mut expected = 0.0f32;
+                        for kk in 0..k as usize {
+                            let a = bf16_to_f32(x_bf16[ri * k as usize + kk]);
+                            let b = bf16_to_f32(wt_bf16[cj * k as usize + kk]);
+                            expected += a * b;
+                        }
+                        let off = (ri * n as usize + cj) * 4;
+                        let got = f32::from_le_bytes([
+                            y_bytes[off],
+                            y_bytes[off + 1],
+                            y_bytes[off + 2],
+                            y_bytes[off + 3],
+                        ]);
+                        let tol = 0.02 * expected.abs().max(1.0);
+                        if (got - expected).abs() > tol {
+                            bad += 1;
+                        }
+                    }
+                }
+                if bad != 0 {
+                    eprintln!(
+                        "  {:<20} WARN(correctness): sample mismatch: bad={} / 16",
+                        label,
+                        bad
+                    );
+                }
+
+                // DXG queue read_ptr can report completion before true retirement;
+                // use signal-based timing to avoid timeout-biased TFLOPS numbers.
+                let us = {
+                    #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+                    {
+                        match rt.dispatch_batch_profiled_gpu_us(&kernel, grid, &ka, iters as usize) {
+                            Ok(us) => us,
+                            Err(e) => {
+                                eprintln!("  {:<20} FAIL(profile): {}", label, e);
+                                failures.push(format!("{} profile: {}", label, e));
+                                continue;
+                            }
+                        }
+                    }
+                    #[cfg(not(all(feature = "wsl_dxg", not(feature = "rocm"))))]
+                    {
+                        let t0 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            rt.dispatch_async(&kernel, grid, &ka);
+                        }
+                        rt.wait_idle().expect("wait_idle failed");
+                        t0.elapsed().as_micros() as f64 / iters as f64
+                    }
+                };
                 let tf = if us > 0.0 { flops / (us * 1e6) } else { 0.0 };
+                any_success = true;
 
                 eprintln!("  {:<20} {:>8.1} μs  {:>6.1} TFLOPS  grid=({},{},{})",
                     label, us, tf, grid[0], grid[1], grid[2]);
+            }
+
+            if !asm_dump_only && !any_success {
+                let summary = if failures.is_empty() {
+                    "all configs failed without detailed error".to_string()
+                } else {
+                    failures.join(" | ")
+                };
+                eprintln!("  [tile_ir] no runnable config in test_wgp_k64_benchmark: {}", summary);
             }
         });
     }
@@ -4121,7 +4317,7 @@ mod gpu_tests {
             let iters = 20u32;
 
             eprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
-            eprintln!("║  Full-Spectrum Autotuner — RX 7900 XTX (GFX1100)                       ║");
+            eprintln!("║  Full-Spectrum Autotuner — RX 7900 XTX (GFX1201)                       ║");
             eprintln!("║  All tile configs × all sizes, BF16 WMMA GEMM                          ║");
             eprintln!("╚══════════════════════════════════════════════════════════════════════════╝\n");
 
@@ -4415,8 +4611,8 @@ mod gpu_tests {
         let k32 = lower_gemm(&spec32);
         let k64 = lower_gemm(&spec64);
 
-        let asm32 = k32.to_assembly(crate::t0::ir::Target::GFX1100).unwrap();
-        let asm64 = k64.to_assembly(crate::t0::ir::Target::GFX1100).unwrap();
+        let asm32 = k32.to_assembly(crate::t0::ir::Target::GFX1201).unwrap();
+        let asm64 = k64.to_assembly(crate::t0::ir::Target::GFX1201).unwrap();
 
         // Save full assembly to /tmp for inspection
         std::fs::write("/tmp/tile_32x64.s", &asm32).unwrap();
@@ -4951,7 +5147,7 @@ mod gpu_tests {
             .with_epilogue(vec![EpilogueOp::ReLU]);
         assert!(spec.name().contains("_relu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::GFX1201).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ GEMM+ReLU: {} bytes ELF", elf.len());
     }
@@ -4962,7 +5158,7 @@ mod gpu_tests {
             .with_epilogue(vec![EpilogueOp::SiLU]);
         assert!(spec.name().contains("_silu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::GFX1201).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ GEMM+SiLU: {} bytes ELF", elf.len());
     }
@@ -4973,7 +5169,7 @@ mod gpu_tests {
             .with_epilogue(vec![EpilogueOp::GELU]);
         assert!(spec.name().contains("_gelu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::GFX1201).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ GEMM+GELU: {} bytes ELF", elf.len());
     }
@@ -4985,7 +5181,7 @@ mod gpu_tests {
         assert!(spec.name().contains("_bias_relu"));
         assert!(spec.has_epilogue_bias());
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::GFX1201).unwrap();
         assert!(elf.len() > 0);
         // kernel should have extra bias_ptr argument
         let args = kernel.args();
@@ -4999,7 +5195,7 @@ mod gpu_tests {
         let spec = TileGemm::tile_64x64_k16()
             .with_epilogue(vec![EpilogueOp::Scale]);
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::GFX1201).unwrap();
         assert!(elf.len() > 0);
         let args = kernel.args();
         let has_scale_arg = args.iter().any(|a| a.name == "epi_scale");
@@ -5014,7 +5210,7 @@ mod gpu_tests {
         assert!(spec.epilogue.is_empty());
         assert!(!spec.name().contains("_relu"));
         let kernel = lower_gemm(&spec);
-        let elf = kernel.compile(Target::GFX1100).unwrap();
+        let elf = kernel.compile(Target::GFX1201).unwrap();
         assert!(elf.len() > 0);
         eprintln!("✓ Plain GEMM (no epilogue): {} bytes ELF", elf.len());
     }
@@ -5316,4 +5512,3 @@ mod gpu_tests {
         });
     }
 }
-

@@ -8,7 +8,7 @@
 //!     cargo run --example bench_tile_gemm --features rocm --release
 
 fn main() -> Result<(), String> {
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     {
         use t0_gpu::ignis::gpu_context::GpuRuntime;
         use t0_gpu::t0::block_dsl::*;

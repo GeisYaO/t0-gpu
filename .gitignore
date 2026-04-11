@@ -5,3 +5,8 @@ Cargo.lock
 *.swp
 *~
 .DS_Store
+librocdxg
+libdxg
+prompt.txt
+log*
+.codex

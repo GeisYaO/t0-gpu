@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 #[cfg(feature = "rocm")]
-use crate::kfd::GpuBuffer;
+use crate::gpu_backend::GpuBuffer;
 #[cfg(feature = "rocm")]
 use super::tensor::{Tensor, TensorId};
 #[cfg(feature = "rocm")]

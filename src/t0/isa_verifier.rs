@@ -219,20 +219,6 @@ pub fn verify_ops(ops: &[Op]) -> VerifyResult {
                 // Alignment checked post-regalloc (see compile.rs)
             }
 
-            // -- VReg range check --
-            Op::VMov { dst, .. } | Op::VRsqF32 { dst, .. } |
-            Op::VExpF32 { dst, .. } | Op::VRcpF32 { dst, .. } |
-            Op::VSqrtF32 { dst, .. } | Op::VLog2F32 { dst, .. } |
-            Op::VCvtF32U32 { dst, .. } | Op::VCvtU32F32 { dst, .. } => {
-                if dst.0 >= 256 && dst.0 < u32::MAX - 100 {
-                    result.warnings.push(format!(
-                        "Op[{}]: VReg v{} exceeds GFX1100 256-VGPR limit. \
-                         May produce invalid ISA if not remapped by regalloc.",
-                        i, dst.0
-                    ));
-                }
-            }
-
             // -- ScalarLoad SBASE alignment --
             Op::ScalarLoad { base, .. } => {
                 if base.0 % 2 != 0 {

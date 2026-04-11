@@ -14,6 +14,7 @@
 //! ```
 
 use std::process::Command;
+use crate::llvm_toolchain::{find_clang, find_ld_lld};
 use super::ir::*;
 use super::regalloc::{self, RegAlloc};
 use super::asm_emitter::AsmEmitter;
@@ -755,7 +756,7 @@ impl T0Kernel {
         self.v_add_co_u32(addr_lo, addr_lo, offset);
         self.v_add_co_ci_u32(addr_hi, addr_hi);
     }
-    /// C-layout → A-operand transpose (8 WMMA C-regs → 8 bf16x2 A-regs)
+    /// C-layout → A-operand transpose (WMMA C-regs → target-specific bf16x2 A-regs)
     ///
     /// Uses v_permlanex16 (SWAP16) + v_cndmask + bf16 packing.
     /// Pure VALU — no LDS, no barrier.
@@ -778,8 +779,10 @@ impl T0Kernel {
             Operand::InlineInt(16),
         ); // VCC = (lane_id < 16) → VCC=1 for lanes 0-15
 
+        let dst_regs = WmmaFormat::BF16_F32.a_vreg_count(current_target());
+
         // Phase 1: permlanex16 (swap half-waves)
-        for i in 0..8u32 {
+        for i in 0..dst_regs {
             self.v_permlanex16(VReg(dst.0 + i), VReg(src.0 + i));
         }
 
@@ -787,7 +790,7 @@ impl T0Kernel {
         let val_e = tmp;
         let val_o = VReg(tmp.0 + 1);
         let pack_tmp_r = VReg(tmp.0 + 2);
-        for i in 0..8u32 {
+        for i in 0..dst_regs {
             let s = VReg(src.0 + i);
             let swiz = VReg(dst.0 + i);
             let d = VReg(dst.0 + i);
@@ -893,170 +896,194 @@ impl T0Kernel {
     /// Compile to assembly and return (asm_text, final_lds_size).
     /// `final_lds_size` includes any LDS spill regions added by SSA regalloc.
     pub fn to_assembly_with_info(&self, target: Target) -> Result<(String, u32), String> {
-        self.validate()?;
+        with_target_context(target, || -> Result<(String, u32), String> {
+            self.validate()?;
 
-        // Run optimization passes on a copy of ops
-        // Apply kernel-level optimization settings via env vars
-        if let Some(level) = self.opt_level {
-            std::env::set_var("T0_OPT_LEVEL", level.to_string());
-        }
-        if self.skip_cse {
-            let current = std::env::var("T0_DISABLE_PASS").unwrap_or_default();
-            if !current.contains("cse") {
-                if current.is_empty() {
-                    std::env::set_var("T0_DISABLE_PASS", "cse");
-                } else {
-                    std::env::set_var("T0_DISABLE_PASS", format!("{},cse", current));
-                }
+            // Run optimization passes on a copy of ops
+            // Apply kernel-level optimization settings via env vars
+            if let Some(level) = self.opt_level {
+                std::env::set_var("T0_OPT_LEVEL", level.to_string());
             }
-        }
-        let (mut optimized_ops, _stats) = if self.skip_optimize {
-            (self.ops.clone(), super::opt_passes::OptStats::default())
-        } else {
-            super::opt_passes::optimize(self.ops.clone(), &self.coalesced_groups)
-        };
-
-        // SSA round-trip verification (debug builds only)
-        #[cfg(debug_assertions)]
-        {
-            let func = super::ssa_ir::lift_to_ssa(&optimized_ops);
-            let lowered = super::ssa_ir::lower_from_ssa(&func);
-            debug_assert_eq!(
-                lowered.len(), optimized_ops.len(),
-                "[T0 SSA] round-trip op count mismatch: {} vs {} for kernel '{}'",
-                lowered.len(), optimized_ops.len(), self.name
-            );
-            for (i, (orig, low)) in optimized_ops.iter().zip(lowered.iter()).enumerate() {
-                debug_assert_eq!(
-                    format!("{:?}", orig), format!("{:?}", low),
-                    "[T0 SSA] round-trip mismatch at op {} in kernel '{}'", i, self.name
-                );
-            }
-        }
-
-        // Filter vreg_allocs: only keep allocations for VRegs still referenced
-        let live_vregs: std::collections::HashSet<VReg> = optimized_ops.iter()
-            .flat_map(|op| op.vreg_refs())
-            .collect();
-        let filtered_allocs: Vec<_> = self.vreg_allocs.iter()
-            .filter(|va| {
-                (0..va.count).any(|i| live_vregs.contains(&VReg(va.vreg.0 + i)))
-            })
-            .cloned()
-            .collect();
-
-        // Register allocate on optimized ops with filtered allocs
-        let mut final_lds_size = self.lds_size;
-        let alloc = if self.use_ssa_regalloc {
-            let func = super::ssa_ir::lift_to_ssa(&optimized_ops);
-            let intervals = super::ssa_ir::compute_live_intervals(&func, &filtered_allocs);
-            // GFX1100 has 256 VGPRs per SIMD, but experimentally kernels using
-            // >254 VGPRs cause hard hangs (CWSR preemption failure).
-            // Cap at 254 — k32 (254 VGPRs, 0 spills) is proven safe at 80 TF.
-            // WARNING: kernels that need >254 will spill to LDS — verify spill
-            // code correctness before dispatching spilled kernels!
-            let ssa_alloc = super::ssa_regalloc::allocate_ssa(
-                &intervals, &self.sreg_allocs, &func, 254,
-            );
-
-            if !ssa_alloc.spills.is_empty() {
-                let spill_result = super::ssa_regalloc::insert_spill_reloads(
-                    &mut optimized_ops, &ssa_alloc, self.lds_size, self.wg_size,
-                );
-                final_lds_size = self.lds_size + spill_result.spill_lds_bytes;
-            }
-
-            ssa_alloc.to_legacy_regalloc(&func, Some(&optimized_ops))
-        } else {
-            regalloc::allocate(&filtered_allocs, &self.sreg_allocs, &optimized_ops)
-        };
-
-        // Cross-validate SSA regalloc: check for interference violations
-        if self.use_ssa_regalloc && std::env::var("T0_DUMP_ASM").is_ok() {
-            // For every instruction, check that uses and defs don't collide physically
-            let mut conflicts = 0;
-            for (i, op) in optimized_ops.iter().enumerate() {
-                let uses = op.vreg_uses();
-                let defs = op.vreg_defs();
-                // Check: no two distinct USE VRegs map to same physical reg
-                for (a, va) in uses.iter().enumerate() {
-                    for vb in uses.iter().skip(a + 1) {
-                        if va == vb { continue; } // same VReg → OK
-                        if let (Some(&pa), Some(&pb)) = (alloc.vgpr_map.get(va), alloc.vgpr_map.get(vb)) {
-                            if pa == pb {
-                                if conflicts < 10 {
-                                    eprintln!("  CONFLICT op[{}]: use VReg({})=v{} == use VReg({})=v{}",
-                                        i, va.0, pa, vb.0, pb);
-                                }
-                                conflicts += 1;
-                            }
-                        }
-                    }
-                }
-                // Check: DEF VReg doesn't clobber a USE VReg (unless they're the same)
-                for vd in &defs {
-                    for vu in &uses {
-                        if vd == vu { continue; } // in-place op → OK
-                        if let (Some(&pd), Some(&pu)) = (alloc.vgpr_map.get(vd), alloc.vgpr_map.get(vu)) {
-                            if pd == pu {
-                                if conflicts < 10 {
-                                    eprintln!("  CONFLICT op[{}]: def VReg({})=v{} clobbers use VReg({})=v{}",
-                                        i, vd.0, pd, vu.0, pu);
-                                }
-                                conflicts += 1;
-                            }
-                        }
+            if self.skip_cse {
+                let current = std::env::var("T0_DISABLE_PASS").unwrap_or_default();
+                if !current.contains("cse") {
+                    if current.is_empty() {
+                        std::env::set_var("T0_DISABLE_PASS", "cse");
+                    } else {
+                        std::env::set_var("T0_DISABLE_PASS", format!("{},cse", current));
                     }
                 }
             }
-            if conflicts > 0 {
-                eprintln!("[T0] SSA regalloc: {} INTERFERENCE CONFLICTS found!", conflicts);
+            let (mut optimized_ops, _stats) = if self.skip_optimize {
+                (self.ops.clone(), super::opt_passes::OptStats::default())
             } else {
-                eprintln!("[T0] SSA regalloc: no interference conflicts (per-instruction check)");
-            }
-        }
+                super::opt_passes::optimize(self.ops.clone(), &self.coalesced_groups)
+            };
 
-        // Post-regalloc WMMA alignment validation
-        // (pre-regalloc verifier can't check this since it sees virtual VRegs)
-        for (i, op) in optimized_ops.iter().enumerate() {
-            if let Op::Wmma { dst, a, b, c, .. } = op {
-                for (name, vreg) in [("dst", dst), ("a", a), ("b", b), ("c", c)] {
-                    if let Some(&phys) = alloc.vgpr_map.get(vreg) {
-                        if phys % 8 != 0 {
-                            eprintln!(
-                                "[T0 ERROR] Op[{}]: WMMA '{}' VReg({})→v{} NOT 8-aligned! \
-                                 This WILL produce incorrect results on GFX1100.",
-                                i, name, vreg.0, phys
-                            );
+            // SSA round-trip verification (debug builds only)
+            #[cfg(debug_assertions)]
+            {
+                let func = super::ssa_ir::lift_to_ssa(&optimized_ops);
+                let lowered = super::ssa_ir::lower_from_ssa(&func);
+                debug_assert_eq!(
+                    lowered.len(), optimized_ops.len(),
+                    "[T0 SSA] round-trip op count mismatch: {} vs {} for kernel '{}'",
+                    lowered.len(), optimized_ops.len(), self.name
+                );
+                for (i, (orig, low)) in optimized_ops.iter().zip(lowered.iter()).enumerate() {
+                    debug_assert_eq!(
+                        format!("{:?}", orig), format!("{:?}", low),
+                        "[T0 SSA] round-trip mismatch at op {} in kernel '{}'", i, self.name
+                    );
+                }
+            }
+
+            // Filter vreg_allocs: only keep allocations for VRegs still referenced
+            let live_vregs: std::collections::HashSet<VReg> = optimized_ops.iter()
+                .flat_map(|op| op.vreg_refs())
+                .collect();
+            let filtered_allocs: Vec<_> = self.vreg_allocs.iter()
+                .filter(|va| {
+                    (0..va.count).any(|i| live_vregs.contains(&VReg(va.vreg.0 + i)))
+                })
+                .cloned()
+                .collect();
+
+            // Register allocate on optimized ops with filtered allocs
+            let mut final_lds_size = self.lds_size;
+            let mut had_spills = false;
+            let alloc = if self.use_ssa_regalloc {
+                let func = super::ssa_ir::lift_to_ssa(&optimized_ops);
+                let intervals = super::ssa_ir::compute_live_intervals(&func, &filtered_allocs);
+                // GFX1100 has 256 VGPRs per SIMD, but experimentally kernels using
+                // >254 VGPRs cause hard hangs (CWSR preemption failure).
+                // Cap at 254 — k32 (254 VGPRs, 0 spills) is proven safe at 80 TF.
+                // WARNING: kernels that need >254 will spill to LDS — verify spill
+                // code correctness before dispatching spilled kernels!
+                let ssa_alloc = super::ssa_regalloc::allocate_ssa(
+                    &intervals, &self.sreg_allocs, &func, 254,
+                );
+
+                if !ssa_alloc.spills.is_empty() {
+                    had_spills = true;
+                    let spill_result = super::ssa_regalloc::insert_spill_reloads(
+                        &mut optimized_ops, &ssa_alloc, self.lds_size, self.wg_size,
+                    );
+                    final_lds_size = self.lds_size + spill_result.spill_lds_bytes;
+                }
+
+                ssa_alloc.to_legacy_regalloc(&func, Some(&optimized_ops))
+            } else {
+                regalloc::allocate(&filtered_allocs, &self.sreg_allocs, &optimized_ops)
+            };
+
+            // Cross-validate SSA regalloc: check for interference violations
+            if self.use_ssa_regalloc && std::env::var("T0_DUMP_ASM").is_ok() {
+                // For every instruction, check that uses and defs don't collide physically
+                let mut conflicts = 0;
+                for (i, op) in optimized_ops.iter().enumerate() {
+                    let uses = op.vreg_uses();
+                    let defs = op.vreg_defs();
+                    // Check: no two distinct USE VRegs map to same physical reg
+                    for (a, va) in uses.iter().enumerate() {
+                        for vb in uses.iter().skip(a + 1) {
+                            if va == vb { continue; } // same VReg → OK
+                            if let (Some(&pa), Some(&pb)) = (alloc.vgpr_map.get(va), alloc.vgpr_map.get(vb)) {
+                                if pa == pb {
+                                    if conflicts < 10 {
+                                        eprintln!("  CONFLICT op[{}]: use VReg({})=v{} == use VReg({})=v{}",
+                                            i, va.0, pa, vb.0, pb);
+                                    }
+                                    conflicts += 1;
+                                }
+                            }
+                        }
+                    }
+                    // Check: DEF VReg doesn't clobber a USE VReg (unless they're the same)
+                    for vd in &defs {
+                        for vu in &uses {
+                            if vd == vu { continue; } // in-place op → OK
+                            if let (Some(&pd), Some(&pu)) = (alloc.vgpr_map.get(vd), alloc.vgpr_map.get(vu)) {
+                                if pd == pu {
+                                    if conflicts < 10 {
+                                        eprintln!("  CONFLICT op[{}]: def VReg({})=v{} clobbers use VReg({})=v{}",
+                                            i, vd.0, pd, vu.0, pu);
+                                    }
+                                    conflicts += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if conflicts > 0 {
+                    eprintln!("[T0] SSA regalloc: {} INTERFERENCE CONFLICTS found!", conflicts);
+                } else {
+                    eprintln!("[T0] SSA regalloc: no interference conflicts (per-instruction check)");
+                }
+            }
+
+            // Post-regalloc WMMA alignment validation
+            // (pre-regalloc verifier can't check this since it sees virtual VRegs)
+            if !had_spills {
+                for (i, op) in optimized_ops.iter().enumerate() {
+                    if let Op::Wmma { dst, a, b, c, format } = op {
+                        for (name, vreg, align) in [
+                            ("dst", dst, format.dst_alignment(target)),
+                            ("a", a, format.a_alignment(target)),
+                            ("b", b, format.b_alignment(target)),
+                            ("c", c, format.c_alignment(target)),
+                        ] {
+                            let align_bytes = match align {
+                                Alignment::None => 1,
+                                Alignment::Align2 => 2,
+                                Alignment::Align4 => 4,
+                                Alignment::Align8 => 8,
+                            };
+                            if let Some(&phys) = alloc.vgpr_map.get(vreg) {
+                                if (phys as u32) % align_bytes != 0 {
+                                    eprintln!(
+                                        "[T0 ERROR] Op[{}]: WMMA '{}' VReg({})→v{} NOT {}-aligned on {}.",
+                                        i, name, vreg.0, phys, align_bytes, target.mcpu_str()
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Post-regalloc verification: catch issues introduced by regalloc/spill
-        // (always runs — these checks are cheap and critical for preventing hangs)
-        let post_verify = super::isa_verifier::verify_and_dump(
-            &optimized_ops, &self.name,
-        );
-        if !post_verify.is_ok() {
-            return Err(format!(
-                "Post-regalloc ISA verification FAILED for '{}': {}",
-                self.name, post_verify.errors.join("; ")
-            ));
-        }
+            if alloc.total_vgprs > 254 {
+                return Err(format!(
+                    "Register allocation exceeded safe VGPR limit for {}: {} > 254",
+                    target.mcpu_str(),
+                    alloc.total_vgprs
+                ));
+            }
 
-        let mut emitter = AsmEmitter::new();
-        emitter.emit_kernel(
-            &self.name,
-            &optimized_ops,
-            &alloc,
-            target,
-            self.kernarg_size,
-            final_lds_size,
-            self.wgp_mode,
-        );
-        Ok((emitter.finish(), final_lds_size))
+            // Post-regalloc verification: catch issues introduced by regalloc/spill
+            // (always runs — these checks are cheap and critical for preventing hangs)
+            let post_verify = super::isa_verifier::verify_and_dump(
+                &optimized_ops, &self.name,
+            );
+            if !post_verify.is_ok() {
+                return Err(format!(
+                    "Post-regalloc ISA verification FAILED for '{}': {}",
+                    self.name, post_verify.errors.join("; ")
+                ));
+            }
+
+            let mut emitter = AsmEmitter::new();
+            emitter.emit_kernel(
+                &self.name,
+                &optimized_ops,
+                &alloc,
+                target,
+                self.kernarg_size,
+                final_lds_size,
+                self.wgp_mode,
+            );
+            Ok((emitter.finish(), final_lds_size))
+        })
     }
 
     /// Validate kernel IR before compilation.
@@ -1209,11 +1236,11 @@ fn llvm_assemble(asm_text: &str, target: Target, name: &str) -> Result<Vec<u8>, 
     fs::write(&asm_path, asm_text)
         .map_err(|e| format!("Failed to write .s file: {}", e))?;
 
-    // Find LLVM tools
-    let llvm_bin = find_llvm_bin()?;
+    // Find LLVM tools from env/PATH/system LLVM install; don't require a ROCm tree.
+    let clang = find_clang()?;
+    let lld = find_ld_lld()?;
 
     // clang: assemble .s → .o
-    let clang = format!("{}/clang", llvm_bin);
     let clang_result = Command::new(&clang)
         .args([
             "-x", "assembler",
@@ -1229,15 +1256,19 @@ fn llvm_assemble(asm_text: &str, target: Target, name: &str) -> Result<Vec<u8>, 
 
     if !clang_result.status.success() {
         let stderr = String::from_utf8_lossy(&clang_result.stderr);
-        // Include assembly source for debugging
+        if super::verbose_diagnostics_enabled() {
+            return Err(format!(
+                "clang assembly failed:\n{}\n\n--- Assembly source ---\n{}",
+                stderr, asm_text
+            ));
+        }
         return Err(format!(
-            "clang assembly failed:\n{}\n\n--- Assembly source ---\n{}",
-            stderr, asm_text
+            "clang assembly failed:\n{}\n\n(re-run with T0_VERBOSE_COMPILE=1 or T0_DUMP_ASM=1 to include full assembly source)",
+            stderr
         ));
     }
 
     // ld.lld: link .o → .hsaco (shared library)
-    let lld = format!("{}/ld.lld", llvm_bin);
     let link_result = Command::new(&lld)
         .args([
             "--shared",
@@ -1265,24 +1296,6 @@ fn llvm_assemble(asm_text: &str, target: Target, name: &str) -> Result<Vec<u8>, 
     let _ = fs::remove_file(&co_path);
 
     Ok(co_bytes)
-}
-
-/// Find LLVM binary directory from ROCm installation.
-fn find_llvm_bin() -> Result<String, String> {
-    let candidates = [
-        "/opt/rocm-7.1.1/llvm/bin",
-        "/opt/rocm-7.1.1/bin",
-        "/opt/rocm/llvm/bin",
-        "/opt/rocm/bin",
-    ];
-    for path in &candidates {
-        let clang = format!("{}/clang", path);
-        if std::path::Path::new(&clang).exists() {
-            return Ok(path.to_string());
-        }
-    }
-    Err("LLVM/ROCm installation not found. \
-         Checked: /opt/rocm-7.1.1/llvm/bin, /opt/rocm/llvm/bin".to_string())
 }
 
 // ============================================================================
@@ -1361,7 +1374,7 @@ mod tests {
         eprintln!("--- Scale kernel assembly ---\n{}", asm);
     }
 
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     #[test]
     fn test_compile_to_elf() {
         let mut k = T0Kernel::new("t0_nop_elf");

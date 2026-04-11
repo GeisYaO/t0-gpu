@@ -16,16 +16,16 @@
 //! All kernels use 40-byte kernarg:
 //!   [ptr0(8), ptr1(8), ptr2(8), seq(4), chunk_or_d(4), d_head(4), n_chunks(4)]
 
-#[cfg(feature = "rocm")]
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
 use std::sync::Arc;
-#[cfg(feature = "rocm")]
-use crate::kfd::GpuBuffer;
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+use crate::gpu_backend::GpuBuffer;
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+use super::super::gpu_context::GpuRuntime;
 #[cfg(feature = "rocm")]
 use super::super::tensor::{Tensor, DType};
 #[cfg(feature = "rocm")]
 use super::super::tape::Tape;
-#[cfg(feature = "rocm")]
-use super::super::gpu_context::GpuRuntime;
 
 /// OCPA configuration
 #[cfg(feature = "rocm")]
@@ -585,5 +585,334 @@ fn write_gpu_f32_raw(addr: u64, data: &[f32]) {
     unsafe {
         let ptr = addr as *mut f32;
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+    }
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn build_state_update_kernargs(
+    k_addr: u64,
+    v_addr: u64,
+    w_addr: u64,
+    c_chunk: usize,
+    d_head: usize,
+    seq_len: usize,
+    n_chunks: usize,
+) -> [u8; 40] {
+    let mut ka = [0u8; 40];
+    ka[0..8].copy_from_slice(&k_addr.to_le_bytes());
+    ka[8..16].copy_from_slice(&v_addr.to_le_bytes());
+    ka[16..24].copy_from_slice(&w_addr.to_le_bytes());
+    ka[24..28].copy_from_slice(&(c_chunk as u32).to_le_bytes());
+    ka[28..32].copy_from_slice(&(d_head as u32).to_le_bytes());
+    ka[32..36].copy_from_slice(&(seq_len as u32).to_le_bytes());
+    ka[36..40].copy_from_slice(&(n_chunks as u32).to_le_bytes());
+    ka
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn build_forward_intra_kernargs(
+    q_addr: u64,
+    k_addr: u64,
+    v_addr: u64,
+    o_addr: u64,
+    seq_len: usize,
+) -> [u8; 36] {
+    let mut ka = [0u8; 36];
+    ka[0..8].copy_from_slice(&q_addr.to_le_bytes());
+    ka[8..16].copy_from_slice(&k_addr.to_le_bytes());
+    ka[16..24].copy_from_slice(&v_addr.to_le_bytes());
+    ka[24..32].copy_from_slice(&o_addr.to_le_bytes());
+    ka[32..36].copy_from_slice(&(seq_len as u32).to_le_bytes());
+    ka
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn read_buffer_f32(buf: &GpuBuffer, n: usize) -> Vec<f32> {
+    let mut data = vec![0f32; n];
+    buf.read(unsafe {
+        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
+    });
+    data
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn write_buffer_f32(buf: &GpuBuffer, data: &[f32]) {
+    buf.write(unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+    });
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn read_buffer_bf16_as_f32(buf: &GpuBuffer, n: usize) -> Vec<f32> {
+    let mut raw = vec![0u16; n];
+    buf.read(unsafe {
+        std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, n * 2)
+    });
+    raw.into_iter()
+        .map(crate::t0::tile_ir::bf16_to_f32)
+        .collect()
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn dispatch_state_update_buffers(
+    rt: &Arc<GpuRuntime>,
+    k_buf: &GpuBuffer,
+    v_buf: &GpuBuffer,
+    s_buf: &GpuBuffer,
+    seq: usize,
+    c: usize,
+    d: usize,
+    nc: usize,
+) -> Result<(), String> {
+    let kernel = rt.ensure_kernel_t0(
+        "ocpa_state_update_runtime",
+        || crate::t0::math::ocpa_state_update(),
+        [0, 1, 1],
+        0,
+    )?;
+    let ka = build_state_update_kernargs(
+        k_buf.gpu_addr(),
+        v_buf.gpu_addr(),
+        s_buf.gpu_addr(),
+        c,
+        d,
+        seq,
+        nc,
+    );
+    let grid_x = nc as u32 * kernel.workgroup_size[0];
+    rt.dispatch(&kernel, [grid_x, 1, 1], &ka)
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn dispatch_prefix_sum_buffers(
+    rt: &Arc<GpuRuntime>,
+    s_buf: &GpuBuffer,
+    ps_buf: &GpuBuffer,
+    d: usize,
+    nc: usize,
+) -> Result<(), String> {
+    rt.wait_idle()?;
+    let dd = d * d;
+    let s_data = read_buffer_f32(s_buf, nc * dd);
+    let mut ps_data = vec![0f32; nc * dd];
+    for chunk in 1..nc {
+        for i in 0..dd {
+            ps_data[chunk * dd + i] =
+                ps_data[(chunk - 1) * dd + i] + s_data[(chunk - 1) * dd + i];
+        }
+    }
+    write_buffer_f32(ps_buf, &ps_data);
+    Ok(())
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn dispatch_forward_inter_buffers(
+    rt: &Arc<GpuRuntime>,
+    q_buf: &GpuBuffer,
+    ps_buf: &GpuBuffer,
+    o_inter_buf: &GpuBuffer,
+    seq: usize,
+    c: usize,
+    d: usize,
+    nc: usize,
+) -> Result<(), String> {
+    rt.wait_idle()?;
+    let dd = d * d;
+    let q_data = read_buffer_bf16_as_f32(q_buf, seq * d);
+    let ps_data = read_buffer_f32(ps_buf, nc * dd);
+    let mut o_data = vec![0f32; seq * d];
+
+    for chunk in 0..nc {
+        let row_start = chunk * c;
+        let row_end = (row_start + c).min(seq);
+        let s_chunk = &ps_data[chunk * dd..(chunk + 1) * dd];
+
+        for row in row_start..row_end {
+            for j in 0..d {
+                let mut acc = 0f32;
+                for kk in 0..d {
+                    acc += q_data[row * d + kk] * s_chunk[kk * d + j];
+                }
+                o_data[row * d + j] = acc;
+            }
+        }
+    }
+
+    write_buffer_f32(o_inter_buf, &o_data);
+    Ok(())
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn dispatch_forward_intra_buffers(
+    rt: &Arc<GpuRuntime>,
+    q_buf: &GpuBuffer,
+    k_buf: &GpuBuffer,
+    v_buf: &GpuBuffer,
+    o_buf: &GpuBuffer,
+    seq: usize,
+    c: usize,
+    nc: usize,
+) -> Result<(), String> {
+    let kernel_name = format!("ocpa_fwd_intra_runtime_c{}", c);
+    let kernel = rt.ensure_kernel_t0(
+        &kernel_name,
+        || crate::t0::math::ocpa_forward_intra_with_c(c as u32),
+        [0, 1, 1],
+        0,
+    )?;
+    let ka = build_forward_intra_kernargs(
+        q_buf.gpu_addr(),
+        k_buf.gpu_addr(),
+        v_buf.gpu_addr(),
+        o_buf.gpu_addr(),
+        seq,
+    );
+    let grid_x = nc as u32 * kernel.workgroup_size[0];
+    rt.dispatch(&kernel, [grid_x, 1, 1], &ka)
+}
+
+#[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
+fn add_buffers_inplace(
+    rt: &Arc<GpuRuntime>,
+    src_buf: &GpuBuffer,
+    dst_buf: &GpuBuffer,
+    n: usize,
+) -> Result<(), String> {
+    let kernel = rt.ensure_kernel_blockdsl(
+        "residual_add_ocpa_runtime",
+        || crate::t0::elementwise_kernels::build_residual_add(),
+    )?;
+    let ka = crate::kernargs![
+        src_buf.gpu_addr() => u64,
+        dst_buf.gpu_addr() => u64,
+        n as u32 => u32
+    ];
+    let grid_x = crate::t0::elementwise_kernels::elementwise_grid(n as u32);
+    rt.dispatch(&kernel, [grid_x, 1, 1], &ka)
+}
+
+#[cfg(all(test, feature = "wsl_dxg"))]
+mod dxg_runtime_tests {
+    use super::*;
+    use std::sync::{Arc, OnceLock};
+    use crate::t0::ir::Target;
+    use crate::t0::tile_ir::{bf16_to_f32, f32_to_bf16};
+
+    struct SyncRt(Arc<GpuRuntime>);
+    unsafe impl Sync for SyncRt {}
+    unsafe impl Send for SyncRt {}
+
+    static GPU_RT: OnceLock<SyncRt> = OnceLock::new();
+
+    fn runtime() -> Arc<GpuRuntime> {
+        GPU_RT
+            .get_or_init(|| SyncRt(GpuRuntime::new().expect("Failed to create DXG runtime")))
+            .0
+            .clone()
+    }
+
+    fn upload_bf16(rt: &Arc<GpuRuntime>, data: &[u16]) -> Result<GpuBuffer, String> {
+        let bytes = data.len() * 2;
+        let alloc_bytes = (bytes.max(256) + 255) & !255;
+        let buf = rt.alloc_zero(alloc_bytes)?;
+        buf.write(unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes)
+        });
+        Ok(buf)
+    }
+
+    fn cpu_ocpa_forward_intra(q: &[u16], k: &[u16], v: &[u16], seq: usize, d: usize) -> Vec<f32> {
+        let qf: Vec<f32> = q.iter().copied().map(bf16_to_f32).collect();
+        let kf: Vec<f32> = k.iter().copied().map(bf16_to_f32).collect();
+        let vf: Vec<f32> = v.iter().copied().map(bf16_to_f32).collect();
+        let mut out = vec![0f32; seq * d];
+
+        for row in 0..seq {
+            for col in 0..=row {
+                let mut score = 0f32;
+                for kk in 0..d {
+                    score += qf[row * d + kk] * kf[col * d + kk];
+                }
+                for j in 0..d {
+                    out[row * d + j] += score * vf[col * d + j];
+                }
+            }
+        }
+
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ocpa_forward_runtime_smoke_dxg() {
+        let rt = runtime();
+        assert_eq!(
+            rt.device.target(),
+            Target::GFX1201,
+            "expected gfx1201 / RX 9070 class device"
+        );
+
+        let seq = 64usize;
+        let c = 64usize;
+        let d = 64usize;
+        let nc = 1usize;
+        let total = seq * d;
+
+        let q_f32: Vec<f32> = (0..total)
+            .map(|i| (((i % 23) as i32 - 11) as f32) * 0.01)
+            .collect();
+        let k_f32: Vec<f32> = (0..total)
+            .map(|i| (((i % 19) as i32 - 9) as f32) * 0.0125)
+            .collect();
+        let v_f32: Vec<f32> = (0..total)
+            .map(|i| (((i % 29) as i32 - 14) as f32) * 0.008)
+            .collect();
+
+        let q_bf16: Vec<u16> = q_f32.iter().copied().map(f32_to_bf16).collect();
+        let k_bf16: Vec<u16> = k_f32.iter().copied().map(f32_to_bf16).collect();
+        let v_bf16: Vec<u16> = v_f32.iter().copied().map(f32_to_bf16).collect();
+
+        let q_buf = upload_bf16(&rt, &q_bf16).expect("upload q");
+        let k_buf = upload_bf16(&rt, &k_bf16).expect("upload k");
+        let v_buf = upload_bf16(&rt, &v_bf16).expect("upload v");
+
+        let state_elems = nc * d * d;
+        let s_buf = rt.alloc_f32(state_elems).expect("alloc state");
+        let ps_buf = rt.alloc_f32(state_elems).expect("alloc prefix");
+        let o_inter_buf = rt.alloc_f32(total).expect("alloc o_inter");
+        let out_buf = rt.alloc_f32(total).expect("alloc output");
+
+        dispatch_state_update_buffers(&rt, &k_buf, &v_buf, &s_buf, seq, c, d, nc)
+            .expect("state_update");
+        dispatch_prefix_sum_buffers(&rt, &s_buf, &ps_buf, d, nc)
+            .expect("prefix_sum");
+        dispatch_forward_inter_buffers(&rt, &q_buf, &ps_buf, &o_inter_buf, seq, c, d, nc)
+            .expect("forward_inter");
+        dispatch_forward_intra_buffers(&rt, &q_buf, &k_buf, &v_buf, &out_buf, seq, c, nc)
+            .expect("forward_intra");
+        add_buffers_inplace(&rt, &o_inter_buf, &out_buf, total)
+            .expect("residual add");
+
+        rt.synchronize().expect("sync");
+
+        let gpu_out = rt.read_f32(&out_buf, total);
+        let cpu_ref = cpu_ocpa_forward_intra(&q_bf16, &k_bf16, &v_bf16, seq, d);
+
+        let max_err = gpu_out.iter()
+            .zip(cpu_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!(
+            "[OCPA] gfx1201 /dev/dxg forward smoke: seq={} chunk={} d={} max_err={:.3e} sample={:?}",
+            seq,
+            c,
+            d,
+            max_err,
+            &gpu_out[..8]
+        );
+
+        assert!(gpu_out.iter().all(|v| v.is_finite()), "non-finite OCPA output");
+        assert!(max_err < 7e-2, "OCPA forward max_err={} too large", max_err);
     }
 }

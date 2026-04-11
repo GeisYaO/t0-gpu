@@ -27,7 +27,7 @@ use super::block_dsl::{BlockKernel, BNode, BVal, BType};
 use super::tile_ssa::{TileFunc, Value, ScalarDType, BinOpKind, UnaryOpKind, CmpOpKind, ForLoop};
 use super::tile_ssa_lower;
 use super::dsl::{CompiledKernel, KernArgMeta, KernArgType};
-use super::ir::{Target, ArgKind};
+use super::ir::{with_target_context, Target, ArgKind};
 
 use std::collections::HashMap;
 
@@ -451,7 +451,7 @@ impl BlockKernel {
         // Step 2: Check if this is a GEMM kernel (contains TileLoad2D/TileDot)
         if tile_ssa_lower::analyze_tiled_gemm(&func).is_ok() {
             // GEMM path: lower via tile_ir
-            let lowered = tile_ssa_lower::lower_tiled_gemm(&func)?;
+            let lowered = tile_ssa_lower::lower_tiled_gemm_for_target(target, &func)?;
             // CRITICAL: use compile_with_info to get final LDS size including
             // SSA regalloc spill regions. Without this, KFD under-allocates LDS → GPU hang.
             let (elf, final_lds) = lowered.kernel.compile_with_info(target)?;
@@ -482,7 +482,9 @@ impl BlockKernel {
             // validated for all kernel types including wg_reduce and GEMM.
             let wg_size = self.get_block_size();
             let epl = 1u32;
-            let lowered = tile_ssa_lower::lower_elementwise_1d(&func, wg_size, epl)?;
+            let lowered = with_target_context(target, || {
+                tile_ssa_lower::lower_elementwise_1d(&func, wg_size, epl)
+            })?;
             let elf = lowered.kernel.compile(target)?;
 
             let args: Vec<KernArgMeta> = lowered.kernel.args().iter().map(|a| {
@@ -575,7 +577,7 @@ mod tests {
 
     /// Test: compile_via_ssa produces valid ELF binary (no GPU dispatch).
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_vadd() {
         let mut kb = BlockKernel::new("vadd_ssa", 64);
         let x_ptr = kb.arg_ptr("x");
@@ -601,7 +603,7 @@ mod tests {
 
     /// Test: compile_via_ssa for SiLU produces valid ELF.
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_silu() {
         let mut kb = BlockKernel::new("silu_ssa", 64);
         let x_ptr = kb.arg_ptr("x");
@@ -624,9 +626,9 @@ mod tests {
 
     /// GPU E2E: vector_add via compile_via_ssa() + KFD dispatch
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_vadd_via_ssa_gpu_e2e() {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let n: usize = 64;
         let mut kb = BlockKernel::new("vadd_ssa_e2e", 64);
@@ -647,7 +649,7 @@ mod tests {
         eprintln!("✓ compile_via_ssa: {} bytes ELF (ka_size={})", compiled.elf.len(), compiled.kernarg_size);
 
         // GPU dispatch using crate::kfd API
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -723,7 +725,7 @@ mod tests {
 
     /// Test: LDS path via compile_via_ssa (compilation only)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_lds() {
         let mut kb = BlockKernel::new("lds_ssa", 64);
         let x_ptr = kb.arg_ptr("x");
@@ -752,7 +754,7 @@ mod tests {
 
     /// Test: AtomicAddF32 compile_via_ssa (compilation only)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_atomic() {
         let mut kb = BlockKernel::new("atomic_test", 64);
         let x_ptr = kb.arg_ptr("x");
@@ -773,9 +775,9 @@ mod tests {
 
     /// GPU E2E: LDS round-trip via compile_via_ssa()
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_lds_via_ssa_gpu_e2e() {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let n: usize = 64;
         let mut kb = BlockKernel::new("lds_e2e", 64);
@@ -799,7 +801,7 @@ mod tests {
         let compiled = kb.compile_via_ssa(Target::GFX1100)
             .expect("compile_via_ssa with LDS failed");
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -870,7 +872,7 @@ mod tests {
 
     /// Test: ForLoop compile_via_ssa (compilation only)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_for_loop() {
         let mut kb = BlockKernel::new("loop_compile", 32);
         let out_ptr = kb.arg_ptr("out");
@@ -895,9 +897,9 @@ mod tests {
     /// GPU E2E: ForLoop accumulation via SSA path
     /// Kernel: out[tid] = iter_count (loop runs N times, stores final iter)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_for_loop_via_ssa_gpu_e2e() {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
         let n: usize = 32;
         let loop_iters: u32 = 5;
@@ -921,7 +923,7 @@ mod tests {
         let compiled = kb.compile_via_ssa(Target::GFX1100)
             .expect("compile_via_ssa with for loop failed");
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -988,7 +990,7 @@ mod tests {
 
     /// Test: WMMA operations compile_via_ssa
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_wmma() {
         let mut kb = BlockKernel::new("wmma_compile", 32);
         let out_ptr = kb.arg_ptr("out");
@@ -1012,6 +1014,50 @@ mod tests {
         assert!(compiled.elf.len() > 100);
     }
 
+    #[test]
+    #[cfg(feature = "wsl_dxg")]
+    fn test_compile_via_ssa_wmma_gfx1201_operand_widths() {
+        let mut kb = BlockKernel::new("wmma_compile_gfx1201", 32);
+        let out_ptr = kb.arg_ptr("out");
+        let n = kb.arg_u32("n");
+
+        let acc = kb.zero_acc();
+        let one_f32 = kb.const_f32(1.0);
+        let pk = kb.cvt_pk_bf16(one_f32, one_f32);
+        let frag_a = pk.splat_fragment(&mut kb);
+        let frag_b = pk.splat_fragment(&mut kb);
+        let acc2 = frag_a.wmma(&mut kb, frag_b, acc);
+        let elem = acc2.extract(&mut kb, 0);
+
+        let offsets = kb.arange(0, 32);
+        let mask = offsets.lt(&mut kb, n);
+        kb.store(out_ptr, offsets, elem, mask);
+
+        let func = block_to_ssa(&kb).expect("block_to_ssa failed");
+        let lowered = tile_ssa_lower::lower_elementwise_1d(&func, kb.get_block_size(), 1)
+            .expect("lower_elementwise_1d failed");
+        let asm = lowered.kernel.to_assembly(Target::GFX1201)
+            .expect("GFX1201 WMMA assembly failed");
+        let wmma_line = asm.lines()
+            .find(|line| line.contains("v_wmma_f32_16x16x16_bf16"))
+            .expect("missing WMMA instruction in GFX1201 assembly");
+        let spans: Vec<u32> = wmma_line
+            .split("v[")
+            .skip(1)
+            .map(|part| {
+                let regs = part.split(']').next().expect("unterminated register range");
+                let (lo, hi) = regs.split_once(':').expect("expected register range");
+                hi.parse::<u32>().unwrap() - lo.parse::<u32>().unwrap() + 1
+            })
+            .collect();
+        eprintln!("GFX1201 WMMA: {}", wmma_line);
+        assert_eq!(spans, vec![8, 4, 4, 8], "unexpected GFX1201 WMMA operand widths");
+
+        let compiled = kb.compile_via_ssa(Target::GFX1201)
+            .expect("compile_via_ssa with GFX1201 WMMA failed");
+        assert!(compiled.elf.len() > 100);
+    }
+
     /// Test: WgReduceAdd SSA compilation (no GPU)
     #[test]
     fn test_block_to_ssa_wg_reduce() {
@@ -1032,7 +1078,7 @@ mod tests {
 
     /// Test: WgReduceAdd compile_via_ssa
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_wg_reduce() {
         let mut kb = BlockKernel::new("wg_reduce_compile", 32);
         let out_ptr = kb.arg_ptr("out");
@@ -1113,7 +1159,7 @@ mod tests {
 
     /// Test: TileGemm compile_via_ssa → ELF (full pipeline, no GPU dispatch)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_tile_gemm() {
         use super::super::block_dsl::TileGemmConfig;
 
@@ -1152,15 +1198,15 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════
 
     /// Helper: dispatch a CompiledKernel on GPU with given inputs, return output buffer.
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn gpu_dispatch_1d(
         compiled: &crate::t0::dsl::CompiledKernel,
         inputs: &[&[f32]],  // multiple input buffers
         n: usize,
     ) -> Vec<f32> {
-        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
 
-        let device = KfdDevice::open().unwrap();
+        let device = GpuDevice::open().unwrap();
         let queue = device.create_queue().unwrap();
         let pool = DispatchPool::new(&device, 4).unwrap();
 
@@ -1209,7 +1255,7 @@ mod tests {
     /// Helper: compile with SSA regalloc enabled
     /// BlockKernel doesn't expose set_ssa_regalloc, so we use a lower-level path:
     /// Build T0Kernel from compile() internals, enable SSA regalloc, then compile.
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn compile_with_ssa_regalloc(kb: &BlockKernel) -> Result<crate::t0::dsl::CompiledKernel, String> {
         use crate::t0::dsl::{CompiledKernel, KernArgMeta, KernArgType};
         use crate::t0::ir::ArgKind;
@@ -1245,7 +1291,7 @@ mod tests {
 
     /// L3 test: vadd with SSA regalloc
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_l3_ssa_regalloc_vadd() {
         let n = 64usize;
 
@@ -1285,7 +1331,7 @@ mod tests {
 
     /// L3 test: silu with SSA regalloc (higher register pressure)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_l3_ssa_regalloc_silu() {
         let n = 64usize;
 
@@ -1323,7 +1369,7 @@ mod tests {
 
     /// L3 test: fma with SSA regalloc (3 inputs = more register pressure)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_l3_ssa_regalloc_fma() {
         let n = 64usize;
 
@@ -1712,7 +1758,7 @@ mod tests {
 
     /// Test: IfMask compile_via_ssa produces valid ELF (no GPU)
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_via_ssa_if_else() {
         let mut kb = BlockKernel::new("if_else_elf", 32);
         let x = kb.arg_ptr("x");
@@ -1741,7 +1787,7 @@ mod tests {
     /// COMPILE-ONLY: gemm_tn_naive kernel (same as test_gpu_gemm_tn but no GPU dispatch).
     /// Run with T0_DUMP_ASM=1 to inspect generated ISA safely.
     #[test]
-    #[cfg(feature = "rocm")]
+    #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_compile_gemm_tn_isa_dump() {
         const BM: u32 = 16;
         const BN: u32 = 16;
@@ -1808,4 +1854,3 @@ mod tests {
         assert_eq!(compiled.args.len(), 6); // A, B, C, M, N, K
     }
 }
-

@@ -1504,6 +1504,32 @@ pub fn cse_mach_func_domtree(func: &mut MachFunc) -> usize {
 ///
 /// Returns the number of instructions hoisted.
 
+fn remap_group_base(base: &mut VReg, count: u32, old: VReg, new: VReg) {
+    if old.0 < base.0 {
+        return;
+    }
+    let offset = old.0 - base.0;
+    if offset >= count {
+        return;
+    }
+    if let Some(new_base) = new.0.checked_sub(offset) {
+        *base = VReg(new_base);
+    }
+}
+
+fn remap_group_base_from_map(base: &mut VReg, count: u32, map: &HashMap<VReg, VReg>) {
+    let original = *base;
+    for offset in 0..count {
+        let member = VReg(original.0 + offset);
+        if let Some(&new_member) = map.get(&member) {
+            if let Some(new_base) = new_member.0.checked_sub(offset) {
+                *base = VReg(new_base);
+            }
+            return;
+        }
+    }
+}
+
 /// Rename destination VRegs in an Op according to the rename map.
 fn rename_op_defs(op: &mut Op, map: &HashMap<VReg, VReg>) {
     match op {
@@ -1532,20 +1558,28 @@ fn rename_op_defs(op: &mut Op, map: &HashMap<VReg, VReg>) {
             if let Some(&new) = map.get(dst) { *dst = new; }
         }
         // Memory loads (dst is VReg)
-        Op::GlobalLoad { dst, .. } |
-        Op::LdsLoad { dst, .. } |
-        Op::DsLoadB32 { dst, .. } | Op::DsLoadB64 { dst, .. } |
-        Op::DsLoadB128 { dst, .. } | Op::DsLoadU16 { dst, .. } |
+        Op::GlobalLoad { dst, width, .. } |
+        Op::BufferLoad { dst, width, .. } |
+        Op::LdsLoad { dst, width, .. } => {
+            remap_group_base_from_map(dst, width.vreg_count(), map);
+        }
+        Op::DsLoadB32 { dst, .. } | Op::DsLoadU16 { dst, .. } |
         Op::DsLoadU16D16 { dst, .. } | Op::DsLoadU16D16Hi { dst, .. } => {
             if let Some(&new) = map.get(dst) { *dst = new; }
+        }
+        Op::DsLoadB64 { dst, .. } => {
+            remap_group_base_from_map(dst, 2, map);
+        }
+        Op::DsLoadB128 { dst, .. } => {
+            remap_group_base_from_map(dst, 4, map);
         }
         // Atomics with return
         Op::GlobalAtomicAddU32Rtn { dst, .. } => {
             if let Some(&new) = map.get(dst) { *dst = new; }
         }
         // WMMA (dst is VReg)
-        Op::Wmma { dst, .. } => {
-            if let Some(&new) = map.get(dst) { *dst = new; }
+        Op::Wmma { dst, format, .. } => {
+            remap_group_base_from_map(dst, format.dst_vreg_count(current_target()), map);
         }
         // Wave reductions (val is read/write, tmp is scratch)
         Op::WaveReduceAddF32 { val, tmp } |
@@ -1621,35 +1655,48 @@ fn rename_op_uses(op: &mut Op, old: VReg, new: VReg) {
         }
         // Global memory
         Op::GlobalLoad { addr, .. } => {
-            if *addr == old { *addr = new; }
+            remap_group_base(addr, 2, old, new);
         }
-        Op::GlobalStore { addr, src, .. } => {
-            if *addr == old { *addr = new; }
-            if *src == old { *src = new; }
+        Op::GlobalStore { addr, src, width, .. } => {
+            remap_group_base(addr, 2, old, new);
+            remap_group_base(src, width.vreg_count(), old, new);
+        }
+        Op::BufferLoad { voffset, .. } => {
+            if *voffset == old { *voffset = new; }
+        }
+        Op::BufferStore { voffset, src, width, .. } => {
+            if *voffset == old { *voffset = new; }
+            remap_group_base(src, width.vreg_count(), old, new);
         }
         Op::GlobalAtomicAddF32 { addr, src, .. } => {
-            if *addr == old { *addr = new; }
+            remap_group_base(addr, 2, old, new);
             if *src == old { *src = new; }
         }
         Op::GlobalAtomicAddU32Rtn { addr, src, .. } => {
-            if *addr == old { *addr = new; }
+            remap_group_base(addr, 2, old, new);
             if *src == old { *src = new; }
         }
         // LDS (legacy)
         Op::LdsLoad { addr, .. } => {
             if *addr == old { *addr = new; }
         }
-        Op::LdsStore { addr, src, .. } => {
+        Op::LdsStore { addr, src, width, .. } => {
             if *addr == old { *addr = new; }
-            if *src == old { *src = new; }
+            remap_group_base(src, width.vreg_count(), old, new);
         }
         // DS stores (all widths)
         Op::DsStoreB16 { vaddr, src, .. } |
-        Op::DsStoreB32 { vaddr, src, .. } |
-        Op::DsStoreB64 { vaddr, src, .. } |
-        Op::DsStoreB128 { vaddr, src, .. } => {
+        Op::DsStoreB32 { vaddr, src, .. } => {
             if *vaddr == old { *vaddr = new; }
             if *src == old { *src = new; }
+        }
+        Op::DsStoreB64 { vaddr, src, .. } => {
+            if *vaddr == old { *vaddr = new; }
+            remap_group_base(src, 2, old, new);
+        }
+        Op::DsStoreB128 { vaddr, src, .. } => {
+            if *vaddr == old { *vaddr = new; }
+            remap_group_base(src, 4, old, new);
         }
         // DS loads (all widths)
         Op::DsLoadB32 { vaddr, .. } |
@@ -1686,10 +1733,11 @@ fn rename_op_uses(op: &mut Op, old: VReg, new: VReg) {
             if *src == old { *src = new; }
         }
         // WMMA (rename a, b, c inputs)
-        Op::Wmma { a, b, c, .. } => {
-            if *a == old { *a = new; }
-            if *b == old { *b = new; }
-            if *c == old { *c = new; }
+        Op::Wmma { a, b, c, format, .. } => {
+            let target = current_target();
+            remap_group_base(a, format.a_vreg_count(target), old, new);
+            remap_group_base(b, format.b_vreg_count(target), old, new);
+            remap_group_base(c, format.c_vreg_count(target), old, new);
         }
         // Wave reductions (val and tmp are both read/write)
         Op::WaveReduceAddF32 { val, tmp } |
@@ -2853,6 +2901,44 @@ mod tests {
                 "op {} mismatch after round-trip", i
             );
         }
+    }
+
+    #[test]
+    fn test_rename_op_uses_wmma_group_member_updates_base_on_gfx1201() {
+        with_target_context(Target::GFX1201, || {
+            let mut op = Op::Wmma {
+                dst: VReg(100),
+                a: VReg(1),
+                b: VReg(5),
+                c: VReg(9),
+                format: WmmaFormat::BF16_F32,
+            };
+            rename_op_uses(&mut op, VReg(8), VReg(28));
+            match op {
+                Op::Wmma { b, .. } => assert_eq!(b, VReg(25)),
+                _ => panic!("expected WMMA op"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_rename_op_defs_wmma_group_member_updates_base_on_gfx1201() {
+        with_target_context(Target::GFX1201, || {
+            let mut op = Op::Wmma {
+                dst: VReg(100),
+                a: VReg(1),
+                b: VReg(5),
+                c: VReg(9),
+                format: WmmaFormat::BF16_F32,
+            };
+            let mut map = std::collections::HashMap::new();
+            map.insert(VReg(107), VReg(207));
+            rename_op_defs(&mut op, &map);
+            match op {
+                Op::Wmma { dst, .. } => assert_eq!(dst, VReg(200)),
+                _ => panic!("expected WMMA op"),
+            }
+        });
     }
 
     #[test]

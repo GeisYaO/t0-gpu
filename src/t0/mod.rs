@@ -65,3 +65,12 @@ pub use gemm_gen::{GemmConfig, GemmTranspose, auto_select, compute_grid_auto, bu
     auto_select_backward_data, auto_select_backward_weight,
     build_kernargs_backward_data, build_kernargs_backward_weight,
     compute_grid_backward_data, compute_grid_backward_weight};
+
+pub(crate) fn verbose_diagnostics_enabled() -> bool {
+    let verbose = std::env::var("T0_VERBOSE_COMPILE").ok();
+    matches!(
+        verbose.as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on")
+    ) || std::env::var_os("T0_DUMP_ASM").is_some()
+        || std::env::var_os("T0_VERIFY_DUMP").is_some()
+}

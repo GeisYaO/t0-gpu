@@ -1791,24 +1791,189 @@ pub mod gfx11 {
     }
 }
 
+/// RDNA4 GFX1201 instruction encoding constants
+///
+/// Best-effort: uses GFX11 encodings as baseline. Instructions confirmed
+/// identical between RDNA3→RDNA4 are re-exported. Others are marked with
+/// TODO and should be verified with `llvm-mc -mcpu=gfx1201`.
+///
+/// The LLVM compilation path (`to_code_object_llvm`) is the preferred route
+/// for GFX1201 since it parameterizes `-mcpu=gfx1201` automatically.
+pub mod gfx12 {
+    // Re-export: encoding verified identical between GFX11 and GFX12
+    // (same assembly → same error on both targets = same encoding)
+    pub use super::gfx11::{
+        // SOPP
+        S_ENDPGM, S_BARRIER,
+        s_nop, s_branch,
+        s_cbranch_scc0, s_cbranch_scc1,
+        s_cbranch_vccnz, s_cbranch_vccz,
+        s_waitcnt_vmcnt, s_waitcnt_lgkmcnt,
+        // SOP1 / SOPC / SOP2
+        s_mov_b32, s_lshl_b32, s_and_b32, s_xor_b32,
+        s_add_u32, s_sub_u32, s_add_i32, s_sub_i32,
+        s_mul_i32, s_cmp_eq_u32,   s_cmp_lt_u32,
+        s_cmp_ge_u32, s_cselect_b32, 
+        s_addc_u32, s_subb_u32,
+        // VOP1
+        v_mov_b32, v_readfirstlane_b32,
+        v_add_f32, v_sub_f32, v_mul_f32,
+        v_min_f32, v_max_f32, v_rcp_f32,
+        v_sqrt_f32, v_log_f32, v_exp_f32,
+        v_sin_f32, v_cvt_f32_u32, v_cvt_u32_f32,
+        v_and_b32, v_or_b32, v_xor_b32, v_lshlrev_b32,
+        v_mbcnt_lo_u32_b32, 
+        // VOP2
+        v_add_co_u32, v_mul_lo_u32,
+        v_cmp_gt_u32_imm, v_cmp_lt_u32, s_cmp_lg_u32_imm, 
+        v_cmp_eq_u32_imm, v_cmp_gt_i32, v_cmp_gt_f32, 
+        v_cmp_lt_f32, v_cndmask_b32,
+        // VOP3
+        v_fma_f32, v_mul_u32_u24,
+        // DS
+        ds_read_b128, ds_write_b128,
+        ds_bpermute_b32, ds_add_f32, ds_max_f32,
+        ds_swizzle_b32,
+        // SMEM
+        s_load_dword, s_load_dwordx2, s_load_dwordx4,
+        // VOPD
+        v_dual_add_f32_mul_f32,
+        v_dual_add_f32_add_f32,
+        v_dual_max_f32_max_f32,
+        v_dual_mul_f32_mul_f32,
+        v_dual_sub_f32_sub_f32,
+        v_dual_fmac_f32_fmac_f32
+    };
+
+    // ── VMEM (global load/store): GFX12 uses 3-dword encoding (vs GFX11's 2-dword) ──
+    //
+    // Verified with llvm-mc 21:
+    //   GFX11: 8 bytes  (2 dwords) — 0xDCxx xxxx format
+    //   GFX12: 12 bytes (3 dwords) — 0x7C xx xx EE format
+    //
+    // Word0 (LE bytes: 7C b1 b2 EE):
+    //   b3=0xEE, b0=0x7C (off mode)
+    //   b2b1 = 0x0500(b32 load) | 0x0540(b64) | 0x05C0(b128)
+    //   store = load + 0x0180 in b2b1 field
+    // Word1 (loads): vdst register
+    // Word1 (stores): 0x01800000 (fixed header)
+    // Word2: vaddr base register
+
+    pub fn global_load_dword(vdst: u8, vaddr: u8, _offset: i32) -> [u32; 3] {
+        let word0 = 0xEE05007Cu32;
+        let word1 = vdst as u32;
+        let word2 = vaddr as u32;
+        [word0, word1, word2]
+    }
+
+    pub fn global_load_dwordx2(vdst: u8, vaddr: u8, _offset: i32) -> [u32; 3] {
+        let word0 = 0xEE05407Cu32;
+        let word1 = vdst as u32;
+        let word2 = vaddr as u32;
+        [word0, word1, word2]
+    }
+
+    pub fn global_load_dwordx4(vdst: u8, vaddr: u8, _offset: i32) -> [u32; 3] {
+        let word0 = 0xEE05C07Cu32;
+        let word1 = vdst as u32;
+        let word2 = vaddr as u32;
+        [word0, word1, word2]
+    }
+
+    pub fn global_store_dword(vaddr: u8, _vsrc: u8, _offset: i32) -> [u32; 3] {
+        let word0 = 0xEE06807Cu32;
+        let word1 = 0x01800000u32;
+        let word2 = vaddr as u32;
+        [word0, word1, word2]
+    }
+
+    pub fn global_store_dwordx2(vaddr: u8, _vsrc: u8, _offset: i32) -> [u32; 3] {
+        let word0 = 0xEE06C07Cu32;
+        let word1 = 0x01800000u32;
+        let word2 = vaddr as u32;
+        [word0, word1, word2]
+    }
+
+    pub fn global_store_dwordx4(vaddr: u8, _vsrc: u8, _offset: i32) -> [u32; 3] {
+        let word0 = 0xEE07407Cu32;
+        let word1 = 0x01800000u32;
+        let word2 = vaddr as u32;
+        [word0, word1, word2]
+    }
+
+    // WMMA: encoding differs from GFX11 — modifier bit changed
+    //
+    // GFX12 layout changes:
+    //   - Input A/B: compact, 4 VGPR (no duplication like GFX11)
+    //   - Input C:   8 VGPR (f32 acc) or 4 VGPR (f16/bf16 acc)
+    //
+    // Modifier bit:
+    //   GFX11: 0x18000000 (bits 27:26 = 0b11)
+    //   GFX12: 0x10000000 (bit 28 = 1)
+    //
+    // src encoding: same as GFX11 — all sources use 256 + base_reg
+
+    /// v_wmma_f32_16x16x16_f16 — GFX12 encoding
+    /// dst: 8 VGPR (f32 acc), A: 4 VGPR, B: 4 VGPR, C: 8 VGPR
+    pub fn v_wmma_f32_16x16x16_f16(vdst: u8, va: u8, vb: u8, vc: u8) -> [u32; 2] {
+        let word0 = 0xCC404000u32 | (vdst as u32);
+        let src0 = (va as u32) + 256;
+        let src1 = (vb as u32) + 256;
+        let src2 = (vc as u32) + 256;
+        let word1 = 0x10000000u32 | src0 | (src1 << 9) | (src2 << 18);
+        [word0, word1]
+    }
+
+    /// v_wmma_f32_16x16x16_bf16 — GFX12 encoding
+    /// dst: 8 VGPR (f32 acc), A: 4 VGPR, B: 4 VGPR, C: 8 VGPR
+    pub fn v_wmma_f32_16x16x16_bf16(vdst: u8, va: u8, vb: u8, vc: u8) -> [u32; 2] {
+        let word0 = 0xCC414000u32 | (vdst as u32);
+        let src0 = (va as u32) + 256;
+        let src1 = (vb as u32) + 256;
+        let src2 = (vc as u32) + 256;
+        let word1 = 0x10000000u32 | src0 | (src1 << 9) | (src2 << 18);
+        [word0, word1]
+    }
+
+    /// v_wmma_bf16_16x16x16_bf16 — GFX12 encoding
+    /// dst: 4 VGPR (bf16 acc), A: 4 VGPR, B: 4 VGPR, C: 4 VGPR
+    pub fn v_wmma_bf16_16x16x16_bf16(vdst: u8, va: u8, vb: u8, vc: u8) -> [u32; 2] {
+        let word0 = 0xCC434000u32 | (vdst as u32);
+        let src0 = (va as u32) + 256;
+        let src1 = (vb as u32) + 256;
+        let src2 = (vc as u32) + 256;
+        let word1 = 0x10000000u32 | src0 | (src1 << 9) | (src2 << 18);
+        [word0, word1]
+    }
+}
+
+
+use crate::t0::ir::Target;
 
 /// Assembler state for building kernel code
 pub struct Rdna3Assembler {
     code: Vec<u32>,
     vmcnt: u8,   // Current pending vmem loads
     lgkmcnt: u8, // Current pending lgkm ops
+    /// Target GPU architecture
+    target: Target,
     /// Highest VGPR index used + 1 (for KernelConfig validation)
-    max_vgpr: u8,
+    max_vgpr: u16,
     /// Highest SGPR index used + 1 (for KernelConfig validation)
     max_sgpr: u8,
 }
 
 impl Rdna3Assembler {
     pub fn new() -> Self {
+        Self::with_target(Target::GFX1100)
+    }
+
+    pub fn with_target(target: Target) -> Self {
         Self {
             code: Vec::with_capacity(1024),
             vmcnt: 0,
             lgkmcnt: 0,
+            target,
             max_vgpr: 1, // v0 always used (workitem_id)
             max_sgpr: 2, // s[0:1] always used (kernarg_ptr)
         }
@@ -1816,7 +1981,7 @@ impl Rdna3Assembler {
 
     /// Declare the highest VGPR index used in this kernel (e.g., `use_vgprs(48)` means v0..v47).
     /// Call this after all emit() calls to record actual register usage.
-    pub fn use_vgprs(&mut self, count: u8) { self.max_vgpr = self.max_vgpr.max(count); }
+    pub fn use_vgprs(&mut self, count: u16) { self.max_vgpr = self.max_vgpr.max(count); }
 
     /// Declare the highest SGPR index used in this kernel.
     pub fn use_sgprs(&mut self, count: u8) { self.max_sgpr = self.max_sgpr.max(count); }
@@ -1957,19 +2122,28 @@ impl Rdna3Assembler {
     
     /// global_load_dwordx4 with vmcnt tracking
     pub fn global_load_dwordx4(&mut self, vdst: u8, vaddr: u8, offset: i32) {
-        self.emit2(gfx11::global_load_dwordx4(vdst, vaddr, offset));
+        match self.target {
+            Target::GFX1100 => self.emit2(gfx11::global_load_dwordx4(vdst, vaddr, offset)),
+            Target::GFX1201 => self.emit3(gfx12::global_load_dwordx4(vdst, vaddr, offset)),
+        }
         self.vmcnt = self.vmcnt.saturating_add(1);
     }
 
     /// global_load_dword with vmcnt tracking
     pub fn global_load_dword(&mut self, vdst: u8, vaddr: u8, offset: i32) {
-        self.emit2(gfx11::global_load_dword(vdst, vaddr, offset));
+        match self.target {
+            Target::GFX1100 => self.emit2(gfx11::global_load_dword(vdst, vaddr, offset)),
+            Target::GFX1201 => self.emit3(gfx12::global_load_dword(vdst, vaddr, offset)),
+        }
         self.vmcnt = self.vmcnt.saturating_add(1);
     }
 
     /// global_load_dwordx2 with vmcnt tracking
     pub fn global_load_dwordx2(&mut self, vdst: u8, vaddr: u8, offset: i32) {
-        self.emit2(gfx11::global_load_dwordx2(vdst, vaddr, offset));
+        match self.target {
+            Target::GFX1100 => self.emit2(gfx11::global_load_dwordx2(vdst, vaddr, offset)),
+            Target::GFX1201 => self.emit3(gfx12::global_load_dwordx2(vdst, vaddr, offset)),
+        }
         self.vmcnt = self.vmcnt.saturating_add(1);
     }
     
@@ -2001,17 +2175,26 @@ impl Rdna3Assembler {
     
     /// global_store_dwordx4
     pub fn global_store_dwordx4(&mut self, vaddr: u8, vsrc: u8, offset: i32) {
-        self.emit2(gfx11::global_store_dwordx4(vaddr, vsrc, offset));
+        match self.target {
+            Target::GFX1100 => self.emit2(gfx11::global_store_dwordx4(vaddr, vsrc, offset)),
+            Target::GFX1201 => self.emit3(gfx12::global_store_dwordx4(vaddr, vsrc, offset)),
+        }
     }
     
     /// global_store_dwordx2 - stores 2 dwords (64 bits)
     pub fn global_store_dwordx2(&mut self, vaddr: u8, vsrc: u8, offset: i32) {
-        self.emit2(gfx11::global_store_dwordx2(vaddr, vsrc, offset));
+        match self.target {
+            Target::GFX1100 => self.emit2(gfx11::global_store_dwordx2(vaddr, vsrc, offset)),
+            Target::GFX1201 => self.emit3(gfx12::global_store_dwordx2(vaddr, vsrc, offset)),
+        }
     }
     
     /// global_store_dword - stores 1 dword
     pub fn global_store_dword(&mut self, vaddr: u8, vsrc: u8, offset: i32) {
-        self.emit2(gfx11::global_store_dword(vaddr, vsrc, offset));
+        match self.target {
+            Target::GFX1100 => self.emit2(gfx11::global_store_dword(vaddr, vsrc, offset)),
+            Target::GFX1201 => self.emit3(gfx12::global_store_dword(vaddr, vsrc, offset)),
+        }
     }
     
     /// Store a 16×16 WMMA C-layout tile to global memory in row-major order.
@@ -2194,7 +2377,10 @@ impl Rdna3Assembler {
     
     /// WMMA matrix multiply
     pub fn wmma_f32_16x16x16_bf16(&mut self, vdst: u8, va: u8, vb: u8, vc: u8) {
-        self.emit2(gfx11::v_wmma_f32_16x16x16_bf16(vdst, va, vb, vc));
+        match self.target {
+            Target::GFX1100 => self.emit2(gfx11::v_wmma_f32_16x16x16_bf16(vdst, va, vb, vc)),
+            Target::GFX1201 => self.emit2(gfx12::v_wmma_f32_16x16x16_bf16(vdst, va, vb, vc)),
+        }
     }
     
     /// Fused multiply-add
