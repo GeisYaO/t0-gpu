@@ -24,7 +24,7 @@
 //! ```
 
 #[allow(unused_imports)]
-use super::ir::{Target, VReg, SReg, SRegPair, Operand, Width, Alignment, WmmaFormat};
+use super::ir::{current_target, with_target_context, Target, VReg, SReg, SRegPair, Operand, Width, Alignment, WmmaFormat};
 use super::compile::T0Kernel;
 use super::dsl::CompiledKernel;
 use super::gemm_gen;
@@ -51,12 +51,9 @@ pub struct TileGemmConfig {
 }
 
 impl TileGemmConfig {
-    /// Auto-select optimal tile configuration based on matrix dimensions.
-    ///
-    /// Delegates to `gemm_gen::auto_select()` which has been tuned via
-    /// empirical sweep data on RX 7900 XTX.
-    pub fn auto(m: u32, k: u32, n: u32) -> Self {
-        let cfg = gemm_gen::auto_select(m, k, n);
+    /// Auto-select optimal tile configuration for an explicit target.
+    pub fn auto_for_target(target: Target, m: u32, k: u32, n: u32) -> Self {
+        let cfg = with_target_context(target, || gemm_gen::auto_select(m, k, n));
         Self {
             tile_m: cfg.tile_m,
             tile_n: cfg.tile_n,
@@ -65,6 +62,15 @@ impl TileGemmConfig {
             split_k: cfg.split_k.unwrap_or(1),
             swap_grid: cfg.swap_grid,
         }
+    }
+
+    /// Auto-select optimal tile configuration based on matrix dimensions.
+    ///
+    /// Uses the target currently installed in `with_target_context(...)`.
+    /// Without an explicit target context, this preserves the historical
+    /// `GFX1100` default behavior.
+    pub fn auto(m: u32, k: u32, n: u32) -> Self {
+        Self::auto_for_target(current_target(), m, k, n)
     }
 
     /// Convert to gemm_gen::GemmConfig for codegen.

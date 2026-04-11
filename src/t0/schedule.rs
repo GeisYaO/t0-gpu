@@ -337,6 +337,7 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
 /// ```
 #[derive(Clone, Debug)]
 pub struct AutoGemmSchedule {
+    pub target: Target,
     pub tile_m: usize,
     pub tile_n: usize,
     pub tile_k: usize,
@@ -347,15 +348,15 @@ pub struct AutoGemmSchedule {
 }
 
 impl AutoGemmSchedule {
-    /// Auto-select optimal GEMM tile parameters for the given problem size.
-    /// Uses exhaustive search over the tile space.
-    pub fn for_problem(m: u32, n: u32, k: u32) -> Self {
+    /// Auto-select optimal GEMM tile parameters for the given problem size and target.
+    pub fn for_target(target: Target, m: u32, n: u32, k: u32) -> Self {
         use super::cost_model::{self, DataFormat};
 
-        let cost = cost_model::best_gemm_config(m, n, k, DataFormat::BF16)
+        let cost = cost_model::best_gemm_config_for_target(target, m, n, k, DataFormat::BF16)
             .expect("no feasible GEMM tile configuration found");
 
         let sched = AutoGemmSchedule {
+            target,
             tile_m: cost.config.tile_m as usize,
             tile_n: cost.config.tile_n as usize,
             tile_k: cost.config.tile_k as usize,
@@ -366,17 +367,43 @@ impl AutoGemmSchedule {
         };
 
         eprintln!(
-            "[AutoSchedule] M={} N={} K={} → tile={}×{}×{} waves={} {:.1}T ({}) VGPRs={}",
-            m, n, k, sched.tile_m, sched.tile_n, sched.tile_k,
-            sched.waves, sched.estimated_tflops, sched.bottleneck, cost.vgprs
+            "[AutoSchedule] {:?} M={} N={} K={} → tile={}×{}×{} waves={} {:.1}T ({}) VGPRs={}",
+            target,
+            m,
+            n,
+            k,
+            sched.tile_m,
+            sched.tile_n,
+            sched.tile_k,
+            sched.waves,
+            sched.estimated_tflops,
+            sched.bottleneck,
+            cost.vgprs
         );
 
         sched
     }
 
+    /// Auto-select optimal GEMM tile parameters for the given problem size.
+    /// Uses exhaustive search over the tile space.
+    pub fn for_problem(m: u32, n: u32, k: u32) -> Self {
+        Self::for_target(current_target(), m, n, k)
+    }
+
     /// Create from explicit tile parameters (for testing or override).
     pub fn with_tiles(tile_m: usize, tile_n: usize, tile_k: usize, waves: u32) -> Self {
+        Self::with_tiles_for_target(current_target(), tile_m, tile_n, tile_k, waves)
+    }
+
+    pub fn with_tiles_for_target(
+        target: Target,
+        tile_m: usize,
+        tile_n: usize,
+        tile_k: usize,
+        waves: u32,
+    ) -> Self {
         AutoGemmSchedule {
+            target,
             tile_m, tile_n, tile_k, waves,
             use_lds: false,
             estimated_tflops: 0.0,
@@ -386,7 +413,12 @@ impl AutoGemmSchedule {
 }
 
 impl Schedule for AutoGemmSchedule {
-    fn name(&self) -> &'static str { "GFX1100 (Auto)" }
+    fn name(&self) -> &'static str {
+        match self.target {
+            Target::GFX1100 => "GFX1100 (Auto)",
+            Target::GFX1201 => "GFX1201 (Auto)",
+        }
+    }
     fn gemm_tile_mn(&self) -> (usize, usize) { (self.tile_m, self.tile_n) }
     fn gemm_tile_k(&self) -> usize { self.tile_k }
     fn use_wmma(&self) -> bool { true }
@@ -402,7 +434,7 @@ impl Schedule for AutoGemmSchedule {
     }
     fn elems_per_thread(&self) -> usize { 4 }
     fn lds_budget(&self) -> u32 { 65536 }
-    fn target(&self) -> Target { Target::GFX1100 }
+    fn target(&self) -> Target { self.target }
 }
 
 /// One-call entry point: auto-select tiles → build GEMM kernel → return T0Kernel.
@@ -414,6 +446,11 @@ impl Schedule for AutoGemmSchedule {
 /// ```
 pub fn auto_build_gemm(m: u32, n: u32, k: u32) -> T0Kernel {
     let sched = AutoGemmSchedule::for_problem(m, n, k);
+    build_gemm_forward(&sched)
+}
+
+pub fn auto_build_gemm_for_target(target: Target, m: u32, n: u32, k: u32) -> T0Kernel {
+    let sched = AutoGemmSchedule::for_target(target, m, n, k);
     build_gemm_forward(&sched)
 }
 

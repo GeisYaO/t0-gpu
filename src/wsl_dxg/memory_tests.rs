@@ -14,6 +14,13 @@ mod tests {
     use std::sync::Arc;
     use std::ptr;
 
+    fn dxg_risky_tests_enabled() -> bool {
+        matches!(
+            std::env::var("T0_DXG_ENABLE_RISKY_TESTS").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    }
+
     fn enqueue_barrier_packet(queue: &WslAqlQueue) -> Result<u64, String> {
         queue.ensure_ring_space()?;
 
@@ -103,6 +110,10 @@ mod tests {
     #[test]
     #[ignore]
     fn test_wsl_dxg_barrier_packet_smoke() {
+        if !dxg_risky_tests_enabled() {
+            eprintln!("[DXG][test] skip barrier_packet_smoke: set T0_DXG_ENABLE_RISKY_TESTS=1 to run");
+            return;
+        }
         let device = WslDxgDevice::open().expect("Failed to open DXG device");
         let queue = device.create_queue().expect("Failed to create DXG queue");
         let target = enqueue_barrier_packet(&queue).expect("Failed to enqueue barrier packet");
@@ -114,13 +125,52 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn test_wsl_dxg_gpu_signal_only_smoke() {
+        let device = WslDxgDevice::open().expect("Failed to open DXG device");
+        let (sync_object, sync_cpu_va) = device
+            .create_monitored_fence()
+            .expect("Failed to create monitored fence");
+
+        device
+            .signal_sync_object_from_gpu(sync_object, 1)
+            .expect("Failed to GPU-signal monitored fence");
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        loop {
+            let completed = unsafe { ptr::read_volatile(sync_cpu_va) };
+            if completed == 1 {
+                println!("GPU signal-only smoke retired: fence={}", completed);
+                device.destroy_sync_object(sync_object);
+                return;
+            }
+            if completed == u64::MAX {
+                let state = device.describe_device_state();
+                device.destroy_sync_object(sync_object);
+                panic!("GPU signal-only smoke retired with invalid fence value UINT64_MAX: {}", state);
+            }
+            if start.elapsed() > timeout {
+                let state = device.describe_device_state();
+                device.destroy_sync_object(sync_object);
+                panic!("GPU signal-only smoke did not retire: {}", state);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn test_wsl_dxg_event_write_submit_smoke() {
+        if !dxg_risky_tests_enabled() {
+            eprintln!("[DXG][test] skip event_write_submit_smoke: set T0_DXG_ENABLE_RISKY_TESTS=1 to run");
+            return;
+        }
         let device = WslDxgDevice::open().expect("Failed to open DXG device");
         let (sync_object, sync_cpu_va) = device
             .create_monitored_fence()
             .expect("Failed to create monitored fence");
         let cmd = device
-            .alloc_uncached(4096)
+            .alloc_system(4096)
             .expect("Failed to allocate command buffer");
 
         let mut pm4 = WslPm4CmdBuilder::new();
@@ -142,10 +192,15 @@ mod tests {
         let timeout = std::time::Duration::from_secs(5);
         loop {
             let completed = unsafe { ptr::read_volatile(sync_cpu_va) };
-            if completed >= 1 {
+            if completed == 1 {
                 println!("Event-write command retired: fence={}", completed);
                 device.destroy_sync_object(sync_object);
                 return;
+            }
+            if completed == u64::MAX {
+                let state = device.describe_device_state();
+                device.destroy_sync_object(sync_object);
+                panic!("Event-write command retired with invalid fence value UINT64_MAX: {}", state);
             }
             if start.elapsed() > timeout {
                 let state = device.describe_device_state();

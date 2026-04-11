@@ -106,8 +106,12 @@ impl LoweredDotKernel {
 /// * `k` - Cols of A / cols of B (contraction dimension)
 /// * `n` - Rows of B (= cols of Y in NT mode)
 pub fn lower_dot(m: u32, k: u32, n: u32) -> Result<LoweredDotKernel, String> {
+    lower_dot_for_target(current_target(), m, k, n)
+}
+
+pub fn lower_dot_for_target(target: Target, m: u32, k: u32, n: u32) -> Result<LoweredDotKernel, String> {
     // Auto-select optimal GEMM config based on matrix dimensions
-    let mut config = gemm_gen::auto_select(m, k, n);
+    let mut config = with_target_context(target, || gemm_gen::auto_select(m, k, n));
 
     // CRITICAL: Disable split-K for standalone Dot lowering.
     // Split-K writes to multiple output planes and requires a separate
@@ -116,7 +120,7 @@ pub fn lower_dot(m: u32, k: u32, n: u32) -> Result<LoweredDotKernel, String> {
     config.split_k = None;
 
     // Generate the GEMM kernel (cooperative loading, LDS double-buffer, WMMA)
-    let kernel = gemm_gen::generate(&config);
+    let kernel = with_target_context(target, || gemm_gen::generate(&config));
 
     Ok(LoweredDotKernel { kernel, config })
 }
@@ -356,6 +360,15 @@ pub fn lower_elementwise_1d(func: &TileFunc, wg_size: u32, epl: u32) -> Result<L
         wg_size,
         elements_per_thread: epl,
     })
+}
+
+pub fn lower_elementwise_1d_for_target(
+    target: Target,
+    func: &TileFunc,
+    wg_size: u32,
+    epl: u32,
+) -> Result<LoweredKernel, String> {
+    with_target_context(target, || lower_elementwise_1d(func, wg_size, epl))
 }
 
 // ============================================================================
@@ -1501,6 +1514,10 @@ impl LoweredTiledGemm {
 /// let elf = result.kernel.compile(Target::GFX1100)?;
 /// ```
 pub fn lower_tiled_gemm(func: &TileFunc) -> Result<LoweredTiledGemm, String> {
+    lower_tiled_gemm_for_target(current_target(), func)
+}
+
+pub fn lower_tiled_gemm_for_target(target: Target, func: &TileFunc) -> Result<LoweredTiledGemm, String> {
     // Step 1: 分析 SSA 图
     let analysis = analyze_tiled_gemm(func)?;
     
@@ -1527,7 +1544,7 @@ pub fn lower_tiled_gemm(func: &TileFunc) -> Result<LoweredTiledGemm, String> {
         spec.name(), spec.wg_size(), spec.lds_total(), spec.double_buffer);
     
     // Step 3: 生成内核
-    let kernel = tile_ir::lower_gemm(&spec);
+    let kernel = with_target_context(target, || tile_ir::lower_gemm(&spec));
     
     Ok(LoweredTiledGemm { kernel, spec })
 }

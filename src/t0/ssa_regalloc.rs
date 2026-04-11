@@ -162,7 +162,7 @@ impl FreePool {
     /// Try to allocate `count` consecutive registers with given alignment.
     /// Returns the base physical register number, or None if no fit found.
     fn try_alloc(&mut self, count: u32, alignment: Alignment) -> Option<u8> {
-        let align_mask: u8 = match alignment {
+        let align_mask: u32 = match alignment {
             Alignment::None => 0,
             Alignment::Align2 => 1,
             Alignment::Align4 => 3,
@@ -173,8 +173,12 @@ impl FreePool {
         let mut best: Option<(usize, u8, u32)> = None; // (range_idx, aligned_start, total_waste)
 
         for (fi, &(start, fcount)) in self.ranges.iter().enumerate() {
-            let aligned = (start + align_mask) & !align_mask;
-            let gap = (aligned - start) as u32;
+            let aligned_u32 = ((start as u32) + align_mask) & !align_mask;
+            if aligned_u32 > u8::MAX as u32 {
+                continue;
+            }
+            let aligned = aligned_u32 as u8;
+            let gap = aligned_u32 - start as u32;
             if fcount >= count + gap {
                 let waste = gap + (fcount - count - gap);
                 if best.is_none() || waste < best.unwrap().2 {
@@ -186,12 +190,12 @@ impl FreePool {
 
         if let Some((fi, aligned, _waste)) = best {
             let (start, fcount) = self.ranges[fi];
-            let gap = (aligned - start) as u32;
+            let gap = aligned as u32 - start as u32;
             let used = count + gap;
 
             // Split or remove the range
             if fcount > used {
-                self.ranges[fi] = (start + used as u8, fcount - used);
+                self.ranges[fi] = ((start as u32 + used) as u8, fcount - used);
             } else {
                 self.ranges.remove(fi);
             }
@@ -204,19 +208,20 @@ impl FreePool {
         }
 
         // No free range — allocate from high-water mark
-        let aligned = (self.next_free + align_mask) & !align_mask;
-        let end = aligned as u32 + count;
+        let aligned_u32 = ((self.next_free as u32) + align_mask) & !align_mask;
+        let end = aligned_u32 + count;
         if end > self.max_regs as u32 {
             return None; // would overflow — caller should spill
         }
+        let aligned = aligned_u32 as u8;
 
         // Gap reclaim: recovers alignment-gap VGPRs back into the free pool.
         // PROVEN SAFE: k16/k32 dispatch tested (58.4/77.4 TF, no hangs).
         // k48 hang was caused by coop load cpr=6 non-power-of-2 bug (now assert-blocked).
         // Saves ~15 VGPRs for k32 (254→239), enabling ILP optimization headroom.
-        let gap = aligned - self.next_free;
+        let gap = aligned_u32 - self.next_free as u32;
         if gap > 0 {
-            self.ranges.push((self.next_free, gap as u32));
+            self.ranges.push((self.next_free, gap));
         }
 
         self.next_free = end as u8;

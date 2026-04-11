@@ -152,7 +152,7 @@ pub enum SOperand {
 // ============================================================================
 
 /// GPU target architecture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     GFX1100,  // RDNA3, Navi 31
     GFX1201,  // RDNA4, Navi 48 / RX 9070 class

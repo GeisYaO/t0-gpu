@@ -229,7 +229,9 @@ impl AsmEmitter {
                 let soff_str = if *soffset == SOFFSET_ZERO {
                     match self.target {
                         Target::GFX1100 => "0".to_string(),
-                        Target::GFX1201 => "s0".to_string(),
+                        // gfx1201 llvm-mc rejects literal "0" for MUBUF soffset syntax.
+                        // Use scalar null register (encodes zero) instead of s0.
+                        Target::GFX1201 => "null".to_string(),
                     }
                 } else {
                     format!("s{}", a.phys_s(*soffset))
@@ -258,7 +260,9 @@ impl AsmEmitter {
                 let soff_str = if *soffset == SOFFSET_ZERO {
                     match self.target {
                         Target::GFX1100 => "0".to_string(),
-                        Target::GFX1201 => "s0".to_string(),
+                        // gfx1201 llvm-mc rejects literal "0" for MUBUF soffset syntax.
+                        // Use scalar null register (encodes zero) instead of s0.
+                        Target::GFX1201 => "null".to_string(),
                     }
                 } else {
                     format!("s{}", a.phys_s(*soffset))

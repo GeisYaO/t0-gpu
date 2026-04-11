@@ -2960,7 +2960,7 @@ mod tests {
     fn test_lower_gemm_compiles() {
         // Core test: lower_gemm produces a kernel that compiles to ELF
         let spec = TileGemm::tile_128x64_k16();
-        let kernel = lower_gemm(&spec);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
         let result = kernel.compile(Target::GFX1201);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         let elf = result.unwrap();
@@ -2971,7 +2971,7 @@ mod tests {
     #[test]
     fn test_lower_gemm_64x64_compiles() {
         let spec = TileGemm::tile_64x64_k16();
-        let kernel = lower_gemm(&spec);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
         let result = kernel.compile(Target::GFX1201);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         eprintln!("[tile_ir] {} → {} bytes ELF", spec.name(), result.unwrap().len());
@@ -2980,7 +2980,7 @@ mod tests {
     #[test]
     fn test_lower_gemm_32x64_compiles() {
         let spec = TileGemm::tile_32x64_k16();
-        let kernel = lower_gemm(&spec);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
         let result = kernel.compile(Target::GFX1201);
         assert!(result.is_ok(), "compile failed: {:?}", result.err());
         eprintln!("[tile_ir] {} → {} bytes ELF", spec.name(), result.unwrap().len());
@@ -2992,7 +2992,7 @@ mod tests {
         eprintln!("[tile_ir] {} LDS total: {} bytes (gemm={}, swap={})",
             spec.name(), spec.lds_total(),
             spec.lds_per_buffer() * 2, spec.acc_swap_region_size());
-        let kernel = lower_gemm(&spec);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
         let (elf, final_lds) = kernel.compile_with_info(Target::GFX1201)
             .expect("compile failed for swap config");
         assert!(elf.len() > 100, "ELF too small: {} bytes", elf.len());
@@ -3006,7 +3006,7 @@ mod tests {
         // Compile-only test for k32 standard (no swap).
         let spec = TileGemm::tile_128x128_k32();
         eprintln!("[tile_ir] compiling k32 standard: {}", spec.name());
-        let kernel = lower_gemm(&spec);
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
 
         // ── K-loop instruction analysis ──
         let ops = kernel.ops();
@@ -3066,26 +3066,53 @@ mod tests {
         // 128×128 k64: may spill (GMEM=64 VGPRs)
         let spec64 = TileGemm::tile_128x128_k64();
         eprintln!("\n[tile_ir] compiling 128x128 k64: {} (LDS={})", spec64.name(), spec64.lds_total());
-        let kernel64 = lower_gemm(&spec64);
+        let kernel64 = with_target_context(Target::GFX1201, || lower_gemm(&spec64));
         let _ = kernel64.compile_with_info(Target::GFX1201);  // may fail, that's OK
 
         // 128×64 k64: should fit (ACC=64, GMEM=48)
         let spec64s = TileGemm::tile_128x64_k64();
         eprintln!("\n[tile_ir] compiling 128x64 k64: {} (LDS={})", spec64s.name(), spec64s.lds_total());
-        let kernel64s = lower_gemm(&spec64s);
+        let kernel64s = with_target_context(Target::GFX1201, || lower_gemm(&spec64s));
         let _ = kernel64s.compile_with_info(Target::GFX1201);
 
         // 256×64 k64 WGP: predicted ~166 VGPRs → 4 waves!
         let spec_wgp = TileGemm::tile_256x64_k64_wgp();
         eprintln!("\n[tile_ir] compiling 256x64 k64 WGP: {} (LDS={})", spec_wgp.name(), spec_wgp.lds_total());
-        let kernel_wgp = lower_gemm(&spec_wgp);
+        let kernel_wgp = with_target_context(Target::GFX1201, || lower_gemm(&spec_wgp));
         let _ = kernel_wgp.compile_with_info(Target::GFX1201);
+    }
+
+    #[test]
+    fn test_lower_gemm_64x128_k64_really_spills_on_gfx1201() {
+        let spec = TileGemm {
+            tile_m: 64,
+            tile_n: 128,
+            tile_k: 64,
+            wgp_mode: false,
+            double_buffer: true,
+            split_k: 1,
+            swap_grid: true,
+            transpose: TileTranspose::NT,
+            acc_swap: false,
+            epilogue: vec![],
+        };
+        let kernel = with_target_context(Target::GFX1201, || lower_gemm(&spec));
+        let base_lds = kernel.lds_size();
+        let (_elf, final_lds) = kernel.compile_with_info(Target::GFX1201)
+            .expect("compile failed for 64x128 k64");
+        assert!(
+            final_lds > base_lds,
+            "expected real spill-backed LDS growth for {}, base={} final={}",
+            spec.name(),
+            base_lds,
+            final_lds,
+        );
     }
 
     #[test]
     #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
     fn test_lower_gemm_128x128_swap_correctness() {
-        use crate::gpu_backend::{GpuDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use crate::gpu_backend::{DispatchPool, GpuDevice, GpuKernel, KernelLoadConfig};
 
         let spec = TileGemm::tile_128x128_k16_swap();
         let kernel = lower_gemm(&spec);
@@ -3214,6 +3241,9 @@ pub fn build_kernargs(
     spec: &TileGemm,
 ) -> Vec<u8> {
     let sk_shift: u32 = match spec.split_k { 1=>0, 2=>1, 4=>2, 8=>3, 16=>4, _=>0 };
+    if spec.split_k > 1 {
+        panic!("build_kernargs() requires explicit M for split_k>1; use build_kernargs_m()");
+    }
     // For split-K: each partition writes to y_addr + partition_id * y_split_stride
     // y_split_stride = M * N * 4 bytes (full output matrix per partition)
     // For sk=1: unused, set to 0
@@ -3239,7 +3269,14 @@ pub fn build_kernargs_m(
     spec: &TileGemm,
 ) -> Vec<u8> {
     let sk_shift: u32 = match spec.split_k { 1=>0, 2=>1, 4=>2, 8=>3, 16=>4, _=>0 };
-    let y_split_stride: u32 = 0;
+    let y_split_stride: u32 = if spec.split_k > 1 {
+        m_dim
+            .checked_mul(n_dim)
+            .and_then(|v| v.checked_mul(4))
+            .expect("y_split_stride overflow for split_k kernel")
+    } else {
+        0
+    };
     let mut ka = Vec::with_capacity(48);
     ka.extend_from_slice(&x_addr.to_le_bytes());     // arg 0: X ptr
     ka.extend_from_slice(&wt_addr.to_le_bytes());    // arg 1: WT ptr
@@ -4030,9 +4067,17 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn test_wgp_k64_benchmark() {
-        use std::time::Instant;
-
         with_rt(|rt| {
+            #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+            {
+                if !matches!(rt.device.target(), Target::GFX1201) {
+                    eprintln!(
+                        "\n[tile_ir] WARN: running test_wgp_k64_benchmark on non-GFX1201 target in wsl_dxg path (current: {:?})",
+                        rt.device.target()
+                    );
+                }
+            }
+
             let m = 4096u32; let k = 4096u32; let n = 4096u32;
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
             let warmup = 10u32;
@@ -4044,7 +4089,7 @@ mod gpu_tests {
             let wt_buf = upload_bf16(rt, &wt_bf16);
 
             eprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
-            eprintln!("║  WGP k64 Benchmark — 4096³ GEMM, RX 7900 XTX (GFX1201)                ║");
+            eprintln!("║  WGP k64 Benchmark — 4096³ GEMM, target={:?}                          ║", rt.device.target());
             eprintln!("╚══════════════════════════════════════════════════════════════════════════╝\n");
 
             let configs: Vec<(&str, TileGemm)> = vec![
@@ -4061,6 +4106,9 @@ mod gpu_tests {
                     s
                 }),
             ];
+            let asm_dump_only = std::env::var_os("T0_DUMP_ASM").is_some();
+            let mut any_success = false;
+            let mut failures: Vec<String> = Vec::new();
 
             for (label, spec) in &configs {
                 let y_buf = rt.alloc_zero((m * n * 4) as usize).expect("alloc Y");
@@ -4078,20 +4126,105 @@ mod gpu_tests {
                 );
                 let grid = compute_grid(spec, m, n);
 
-                for _ in 0..warmup {
-                    let _ = rt.dispatch(&kernel, grid, &ka);
+                if asm_dump_only {
+                    eprintln!(
+                        "  {:<20} SKIP: T0_DUMP_ASM=1 (ASM dump only mode, no GPU dispatch)",
+                        label
+                    );
+                    continue;
                 }
 
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    rt.dispatch_async(&kernel, grid, &ka);
+                let mut warmup_ok = true;
+                for _ in 0..warmup {
+                    if let Err(e) = rt.dispatch(&kernel, grid, &ka) {
+                        eprintln!("  {:<20} FAIL(warmup): {}", label, e);
+                        failures.push(format!("{} warmup: {}", label, e));
+                        warmup_ok = false;
+                        break;
+                    }
                 }
-                rt.wait_idle();
-                let us = t0.elapsed().as_micros() as f64 / iters as f64;
+                if !warmup_ok {
+                    continue;
+                }
+
+                // Correctness probe (sampled): report mismatch, but do not gate throughput output.
+                if let Err(e) = rt.dispatch(&kernel, grid, &ka) {
+                    eprintln!("  {:<20} FAIL(correctness-dispatch): {}", label, e);
+                    failures.push(format!("{} correctness-dispatch: {}", label, e));
+                    continue;
+                }
+                let mut y_bytes = vec![0u8; (m * n * 4) as usize];
+                y_buf.read(&mut y_bytes);
+                let sample_rows = [0usize, (m as usize) / 3, (m as usize) * 2 / 3, (m as usize) - 1];
+                let sample_cols = [0usize, (n as usize) / 3, (n as usize) * 2 / 3, (n as usize) - 1];
+                let mut bad = 0usize;
+                for &ri in &sample_rows {
+                    for &cj in &sample_cols {
+                        let mut expected = 0.0f32;
+                        for kk in 0..k as usize {
+                            let a = bf16_to_f32(x_bf16[ri * k as usize + kk]);
+                            let b = bf16_to_f32(wt_bf16[cj * k as usize + kk]);
+                            expected += a * b;
+                        }
+                        let off = (ri * n as usize + cj) * 4;
+                        let got = f32::from_le_bytes([
+                            y_bytes[off],
+                            y_bytes[off + 1],
+                            y_bytes[off + 2],
+                            y_bytes[off + 3],
+                        ]);
+                        let tol = 0.02 * expected.abs().max(1.0);
+                        if (got - expected).abs() > tol {
+                            bad += 1;
+                        }
+                    }
+                }
+                if bad != 0 {
+                    eprintln!(
+                        "  {:<20} WARN(correctness): sample mismatch: bad={} / 16",
+                        label,
+                        bad
+                    );
+                }
+
+                // DXG queue read_ptr can report completion before true retirement;
+                // use signal-based timing to avoid timeout-biased TFLOPS numbers.
+                let us = {
+                    #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+                    {
+                        match rt.dispatch_batch_profiled_gpu_us(&kernel, grid, &ka, iters as usize) {
+                            Ok(us) => us,
+                            Err(e) => {
+                                eprintln!("  {:<20} FAIL(profile): {}", label, e);
+                                failures.push(format!("{} profile: {}", label, e));
+                                continue;
+                            }
+                        }
+                    }
+                    #[cfg(not(all(feature = "wsl_dxg", not(feature = "rocm"))))]
+                    {
+                        let t0 = std::time::Instant::now();
+                        for _ in 0..iters {
+                            rt.dispatch_async(&kernel, grid, &ka);
+                        }
+                        rt.wait_idle().expect("wait_idle failed");
+                        t0.elapsed().as_micros() as f64 / iters as f64
+                    }
+                };
                 let tf = if us > 0.0 { flops / (us * 1e6) } else { 0.0 };
+                any_success = true;
 
                 eprintln!("  {:<20} {:>8.1} μs  {:>6.1} TFLOPS  grid=({},{},{})",
                     label, us, tf, grid[0], grid[1], grid[2]);
+            }
+
+            if !asm_dump_only && !any_success {
+                let summary = if failures.is_empty() {
+                    "all configs failed without detailed error".to_string()
+                } else {
+                    failures.join(" | ")
+                };
+                eprintln!("  [tile_ir] no runnable config in test_wgp_k64_benchmark: {}", summary);
             }
         });
     }

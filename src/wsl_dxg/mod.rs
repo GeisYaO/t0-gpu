@@ -67,6 +67,7 @@ const DXG_HW_QUEUE_FRAME_COUNT: u64 = 0x1000;
 const PM4_SET_SH_REG: u32 = 0x76;
 const PM4_DISPATCH_DIRECT: u32 = 0x15;
 const PM4_ATOMIC_MEM: u32 = 0x1E;
+const PM4_COPY_DATA: u32 = 0x40;
 const PM4_WRITE_DATA: u32 = 0x37;
 const PM4_RELEASE_MEM: u32 = 0x49;
 const PM4_ACQUIRE_MEM: u32 = 0x58;
@@ -122,6 +123,46 @@ const DISPATCH_INITIATOR_COMPUTE_SHADER_EN: u32 = 1 << 0;
 const DISPATCH_INITIATOR_FORCE_START_AT_000: u32 = 1 << 2;
 const DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS: u32 = 1 << 5;
 const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
+const AMD_SIGNAL_KIND_USER: u64 = 1;
+const AMD_SIGNAL_SIZE_BYTES: usize = 64;
+const AMD_SIGNAL_KIND_OFFSET: usize = 0;
+const AMD_SIGNAL_VALUE_OFFSET: usize = 8;
+const AMD_SIGNAL_START_TS_OFFSET: usize = 32;
+const AMD_SIGNAL_END_TS_OFFSET: usize = 40;
+const AQL_RESERVED2_PROFILE_TS: u64 = 1u64 << 0;
+
+#[repr(C, align(64))]
+struct AmdSignalLayout {
+    kind: u64,
+    value: i64,
+    event_mailbox_ptr: u64,
+    event_id: u32,
+    reserved1: u32,
+    start_ts: u64,
+    end_ts: u64,
+    reserved2: u64,
+    reserved3: [u32; 2],
+}
+
+fn verify_amd_signal_layout_once() {
+    static VERIFIED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    VERIFIED.get_or_init(|| {
+        use std::mem::{align_of, size_of, MaybeUninit};
+        let sig = MaybeUninit::<AmdSignalLayout>::uninit();
+        let base = sig.as_ptr() as usize;
+        let kind_off = unsafe { std::ptr::addr_of!((*sig.as_ptr()).kind) as usize - base };
+        let value_off = unsafe { std::ptr::addr_of!((*sig.as_ptr()).value) as usize - base };
+        let start_off = unsafe { std::ptr::addr_of!((*sig.as_ptr()).start_ts) as usize - base };
+        let end_off = unsafe { std::ptr::addr_of!((*sig.as_ptr()).end_ts) as usize - base };
+
+        assert_eq!(size_of::<AmdSignalLayout>(), AMD_SIGNAL_SIZE_BYTES, "amd_signal size mismatch");
+        assert_eq!(align_of::<AmdSignalLayout>(), 64, "amd_signal alignment mismatch");
+        assert_eq!(kind_off, AMD_SIGNAL_KIND_OFFSET, "amd_signal.kind offset mismatch");
+        assert_eq!(value_off, AMD_SIGNAL_VALUE_OFFSET, "amd_signal.value offset mismatch");
+        assert_eq!(start_off, AMD_SIGNAL_START_TS_OFFSET, "amd_signal.start_ts offset mismatch");
+        assert_eq!(end_off, AMD_SIGNAL_END_TS_OFFSET, "amd_signal.end_ts offset mismatch");
+    });
+}
 
 #[inline]
 fn align_up(value: usize, align: usize) -> usize {
@@ -141,6 +182,11 @@ fn low_part(value: u64) -> u32 {
 #[inline]
 fn high_part(value: u64) -> u32 {
     (value >> 32) as u32
+}
+
+#[inline]
+fn make_u64(low: u32, high: u32) -> u64 {
+    (low as u64) | ((high as u64) << 32)
 }
 
 #[inline]
@@ -173,14 +219,40 @@ fn dxg_debug_enabled() -> bool {
     })
 }
 
-fn dxg_platform_atomic_enabled() -> bool {
+fn dxg_platform_atomic_override() -> Option<bool> {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("T0_DXG_USE_PLATFORM_ATOMIC").ok().as_deref() {
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => Some(true),
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => Some(false),
+        _ => None,
+    })
+}
+
+fn dxg_force_hw_queue() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("T0_DXG_USE_PLATFORM_ATOMIC").ok().as_deref(),
+            std::env::var("T0_DXG_FORCE_HW_QUEUE").ok().as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
         )
     })
+}
+
+fn dxg_allow_wgp_legacy() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("T0_DXG_ALLOW_WGP_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn ignore_sigpipe_once() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    });
 }
 
 macro_rules! dxg_debug {
@@ -368,6 +440,9 @@ extern "C" {
     fn D3DKMTWaitForSynchronizationObjectFromCpu(
         pArgs: *const D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU,
     ) -> NTSTATUS;
+    fn D3DKMTWaitForSynchronizationObjectFromGpu(
+        pArgs: *const D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU,
+    ) -> NTSTATUS;
     fn D3DKMTLock2(pArgs: *mut D3DKMT_LOCK2) -> NTSTATUS;
     fn D3DKMTUnlock2(pArgs: *const D3DKMT_UNLOCK2) -> NTSTATUS;
     fn D3DKMTCloseAdapter(pArgs: *const D3DKMT_CLOSEADAPTER) -> NTSTATUS;
@@ -388,6 +463,7 @@ extern "C" {
     fn D3DKMTEnumAdapters2(pArgs: *mut D3DKMT_ENUMADAPTERS2) -> NTSTATUS;
     fn D3DKMTEnumAdapters3(pArgs: *mut D3DKMT_ENUMADAPTERS3) -> NTSTATUS;
     fn D3DKMTQueryAdapterInfo(pArgs: *const D3DKMT_QUERYADAPTERINFO) -> NTSTATUS;
+    fn D3DKMTQueryClockCalibration(pArgs: *mut D3DKMT_QUERYCLOCKCALIBRATION) -> NTSTATUS;
     fn D3DKMTGetDeviceState(pArgs: *mut D3DKMT_GETDEVICESTATE) -> NTSTATUS;
 }
 
@@ -624,6 +700,29 @@ pub struct D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3DKMT_WAITSYNCFGPU_DATA {
+    pub MonitoredFenceValueArray: *const u64,
+    pub FenceValue: u64,
+    pub Reserved: [u64; 8],
+}
+
+impl Default for D3DKMT_WAITSYNCFGPU_DATA {
+    fn default() -> Self {
+        Self { Reserved: [0; 8] }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU {
+    pub hContext: D3DKMT_HANDLE,
+    pub ObjectCount: u32,
+    pub ObjectHandleArray: *const D3DKMT_HANDLE,
+    pub data: D3DKMT_WAITSYNCFGPU_DATA,
+}
+
+#[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct D3DDDICB_LOCK2FLAGS {
     pub Value: u32,
@@ -695,7 +794,7 @@ impl Default for D3DDDI_SYNCHRONIZATIONOBJECTINFO2 {
             Type: D3DDDI_SYNCHRONIZATIONOBJECT_TYPE::Fence,
             Flags: D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS { Value: 0 },
             info: SyncObjectInfoUnion {
-                Fence: FenceInfo { FenceValue: 0 },
+                Reserved: [0; 8],
             },
             SharedHandle: 0,
         }
@@ -773,17 +872,65 @@ pub struct D3DKMT_WAITFORSYNCHRONIZATIONOBJECT2 {
     pub hContext: D3DKMT_HANDLE,
     pub ObjectCount: u32,
     pub ObjectHandleArray: [D3DKMT_HANDLE; 32],
-    pub Flags: u32,
-    pub Timeout: u64,
+    pub data: D3DKMT_WAITSYNC2_DATA,
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
+pub struct D3DDDICB_SIGNALFLAGS {
+    pub Value: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3DKMT_WAITSYNC2_DATA {
+    pub FenceValue: u64,
+    pub Reserved: [u64; 8],
+}
+
+impl Default for D3DKMT_WAITSYNC2_DATA {
+    fn default() -> Self {
+        Self { Reserved: [0; 8] }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3DKMT_SIGNALSYNC2_DATA {
+    pub FenceValue: u64,
+    pub CpuEventHandle: *mut c_void,
+    pub Reserved: [u64; 8],
+}
+
+impl Default for D3DKMT_SIGNALSYNC2_DATA {
+    fn default() -> Self {
+        Self { Reserved: [0; 8] }
+    }
+}
+
+#[repr(C)]
 pub struct D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 {
     pub hContext: D3DKMT_HANDLE,
     pub ObjectCount: u32,
     pub ObjectHandleArray: [D3DKMT_HANDLE; 32],
-    pub Flags: u32,
+    pub Flags: D3DDDICB_SIGNALFLAGS,
+    pub BroadcastContextCount: u32,
+    pub BroadcastContext: [D3DKMT_HANDLE; 64],
+    pub data: D3DKMT_SIGNALSYNC2_DATA,
+}
+
+impl Default for D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 {
+    fn default() -> Self {
+        Self {
+            hContext: 0,
+            ObjectCount: 0,
+            ObjectHandleArray: [0; 32],
+            Flags: D3DDDICB_SIGNALFLAGS { Value: 0 },
+            BroadcastContextCount: 0,
+            BroadcastContext: [0; 64],
+            data: D3DKMT_SIGNALSYNC2_DATA::default(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -792,12 +939,35 @@ pub struct D3DKMT_DESTROYSYNCHRONIZATIONOBJECT {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy)]
+pub union D3DKMT_SIGNALSYNCFGPU_DATA {
+    pub MonitoredFenceValueArray: *const u64,
+    pub Reserved: [u64; 8],
+}
+
+impl Default for D3DKMT_SIGNALSYNCFGPU_DATA {
+    fn default() -> Self {
+        Self { Reserved: [0; 8] }
+    }
+}
+
+#[repr(C)]
 pub struct D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU {
     pub hContext: D3DKMT_HANDLE,
     pub ObjectCount: u32,
     pub ObjectHandleArray: *const D3DKMT_HANDLE,
-    pub MonitoredFenceValueArray: *const u64,
+    pub data: D3DKMT_SIGNALSYNCFGPU_DATA,
+}
+
+impl Default for D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU {
+    fn default() -> Self {
+        Self {
+            hContext: 0,
+            ObjectCount: 0,
+            ObjectHandleArray: ptr::null(),
+            data: D3DKMT_SIGNALSYNCFGPU_DATA::default(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -945,6 +1115,46 @@ pub struct D3DKMT_DEVICE_IDS {
 pub struct D3DKMT_QUERY_DEVICE_IDS {
     pub PhysicalAdapterIndex: u32,
     pub DeviceIds: D3DKMT_DEVICE_IDS,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct DXGK_GPUCLOCKDATA_FLAGS {
+    pub Value: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct DXGK_GPUCLOCKDATA {
+    // Keep split 32-bit lanes to avoid host ABI packing differences.
+    pub GpuFrequencyLow: u32,
+    pub GpuFrequencyHigh: u32,
+    pub GpuClockCounterLow: u32,
+    pub GpuClockCounterHigh: u32,
+    pub CpuClockCounterLow: u32,
+    pub CpuClockCounterHigh: u32,
+    pub Flags: DXGK_GPUCLOCKDATA_FLAGS,
+}
+
+impl DXGK_GPUCLOCKDATA {
+    fn gpu_frequency_hz(self) -> u64 {
+        make_u64(self.GpuFrequencyLow, self.GpuFrequencyHigh)
+    }
+    fn gpu_clock_counter(self) -> u64 {
+        make_u64(self.GpuClockCounterLow, self.GpuClockCounterHigh)
+    }
+    fn cpu_clock_counter(self) -> u64 {
+        make_u64(self.CpuClockCounterLow, self.CpuClockCounterHigh)
+    }
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct D3DKMT_QUERYCLOCKCALIBRATION {
+    pub hAdapter: D3DKMT_HANDLE,
+    pub NodeOrdinal: u32,
+    pub PhysicalAdapterIndex: u32,
+    pub ClockData: DXGK_GPUCLOCKDATA,
 }
 
 #[repr(u32)]
@@ -1144,12 +1354,16 @@ pub struct WslDxgDevice {
     pub segment_gart: u32,
     /// Compute engine index
     pub compute_engine: u32,
+    /// Node ordinal used for compute queue creation and clock calibration.
+    pub compute_node_ordinal: u32,
     /// Queue engine flag used by thunk-proxy allocation metadata
     pub compute_engine_flag: u32,
     /// Whether the compute engine supports hardware queue submission.
     pub compute_hws_enabled: bool,
     /// Adapter metadata parsed from thunk_proxy
     device_info: DxgThunkDeviceInfo,
+    /// Fixed GPU timestamp counter frequency exposed by the DXG thunk.
+    gpu_counter_frequency_hz: u64,
     /// Reserved CPU/GPU shared VA space for host-visible system allocations.
     system_heap: DxgVaHeap,
     /// Reserved CPU/GPU shared VA space for local VRAM allocations.
@@ -1160,6 +1374,13 @@ pub struct WslDxgDevice {
 
 unsafe impl Send for WslDxgDevice {}
 unsafe impl Sync for WslDxgDevice {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DxgClockCalibration {
+    pub gpu_frequency_hz: u64,
+    pub gpu_clock_counter: u64,
+    pub cpu_clock_counter: u64,
+}
 
 /// Global singleton
 static GLOBAL_WSL_DXG_DEVICE: std::sync::OnceLock<Arc<WslDxgDevice>> = std::sync::OnceLock::new();
@@ -1179,11 +1400,81 @@ impl WslDxgDevice {
     }
 
     pub fn target(&self) -> crate::t0::ir::Target {
-        match self.device_id {
-            0x13C0 => crate::t0::ir::Target::GFX1201,
-            _ if self.device_info.major() >= 12 => crate::t0::ir::Target::GFX1201,
-            _ => crate::t0::ir::Target::GFX1100,
+        match self.device_info.major() {
+            11 => crate::t0::ir::Target::GFX1100,
+            12 => crate::t0::ir::Target::GFX1201,
+            major => panic!(
+                "Unsupported gfx major {} for device 0x{:04X}: no fallback target mapping",
+                major, self.device_id
+            ),
         }
+    }
+
+    fn platform_atomic_support(&self) -> bool {
+        dxg_platform_atomic_override().unwrap_or_else(|| self.device_info.platform_atomic_support())
+    }
+
+    fn record_paging_fence_value(&self, fence_value: u64) {
+        if fence_value == 0 {
+            return;
+        }
+        let mut current = self.paging_fence_value.load(std::sync::atomic::Ordering::Relaxed);
+        while current < fence_value {
+            match self.paging_fence_value.compare_exchange_weak(
+                current,
+                fence_value,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn gpu_counter_frequency_hz(&self) -> Result<u64, String> {
+        if self.gpu_counter_frequency_hz == 0 {
+            Err("DXG adapter did not expose gpu_counter_frequency".to_string())
+        } else {
+            Ok(self.gpu_counter_frequency_hz)
+        }
+    }
+
+    pub fn query_clock_calibration(&self) -> Result<DxgClockCalibration, String> {
+        let mut args = D3DKMT_QUERYCLOCKCALIBRATION {
+            hAdapter: self.dxg_adapter,
+            NodeOrdinal: self.compute_node_ordinal,
+            PhysicalAdapterIndex: 0,
+            ..Default::default()
+        };
+        let status = unsafe { D3DKMTQueryClockCalibration(&mut args) };
+        if status != 0 {
+            return Err(format!(
+                "D3DKMTQueryClockCalibration failed: 0x{:08X}",
+                status as u32
+            ));
+        }
+
+        let gpu_frequency_hz = args.ClockData.gpu_frequency_hz();
+        let gpu_clock_counter = args.ClockData.gpu_clock_counter();
+        let cpu_clock_counter = args.ClockData.cpu_clock_counter();
+        if gpu_frequency_hz == 0 {
+            return Err("D3DKMTQueryClockCalibration returned zero GpuFrequency".to_string());
+        }
+
+        dxg_debug!(
+            "[DXG] clock calibration: node={} gpu_freq={} gpu_counter={} cpu_counter={}",
+            self.compute_node_ordinal,
+            gpu_frequency_hz,
+            gpu_clock_counter,
+            cpu_clock_counter,
+        );
+
+        Ok(DxgClockCalibration {
+            gpu_frequency_hz,
+            gpu_clock_counter,
+            cpu_clock_counter,
+        })
     }
 
     pub fn open() -> Result<Arc<Self>, String> {
@@ -1210,7 +1501,10 @@ impl WslDxgDevice {
     }
 
     fn open_device_impl(gpu_id_override: u32) -> Result<Arc<Self>, String> {
-        let (adapter_handle, vendor_id, device_id) = Self::find_amd_adapter()?;
+        // Keep process alive on broken pipe so queue/context Drop can clean up.
+        ignore_sigpipe_once();
+
+        let (adapter_handle, vendor_id, device_id) = Self::find_amd_adapter(gpu_id_override)?;
         dxg_debug!("[DXG] Found AMD GPU: vendor=0x{:04X} device=0x{:04X}", vendor_id, device_id);
 
         let device_info = DxgThunkDeviceInfo::new(adapter_handle)?;
@@ -1218,8 +1512,9 @@ impl WslDxgDevice {
         let compute_engine = device_info.compute_engine();
         let compute_engine_flag = device_info.queue_engine_flag(compute_engine)?;
         let node_ordinal = device_info.engine_ordinal(compute_engine)?;
-        let hws_enabled = device_info.hws_enabled(compute_engine);
-        let disable_gpu_timeout = device_info.should_disable_gpu_timeout(compute_engine);
+        let hws_enabled = device_info.hws_enabled(compute_engine)?;
+        let disable_gpu_timeout = device_info.should_disable_gpu_timeout(compute_engine)?;
+        let gpu_counter_frequency_hz = device_info.gpu_counter_frequency();
 
         let mut create_device = D3DKMT_CREATEDEVICE {
             hAdapter: adapter_handle,
@@ -1231,6 +1526,7 @@ impl WslDxgDevice {
         }
         let device = create_device.hDevice;
         dxg_debug!("[DXG] Device created: hDevice={}", device);
+        Self::set_power_optimization(adapter_handle, device, false);
 
         let local_heap = match Self::reserve_local_heap_space(adapter_handle, &device_info) {
             Ok(heap) => heap,
@@ -1319,21 +1615,25 @@ impl WslDxgDevice {
             segment_vram: 0,
             segment_gart: 1,
             compute_engine,
+            compute_node_ordinal: node_ordinal,
             compute_engine_flag,
             compute_hws_enabled: hws_enabled,
             device_info,
+            gpu_counter_frequency_hz,
             system_heap,
             local_heap,
             paging_fence_value: std::sync::atomic::AtomicU64::new(0),
         });
 
         dxg_debug!(
-            "[DXG] Device initialized: device=0x{:04X} major={} node={} engine={} hws={} vram={}MB gart={}MB",
+            "[DXG] Device initialized: device=0x{:04X} major={} node={} engine={} hws={} platform_atomic={} gpu_counter_hz={} vram={}MB gart={}MB",
             device_id,
             dev.device_info.major(),
             node_ordinal,
             compute_engine,
             hws_enabled,
+            dev.platform_atomic_support(),
+            gpu_counter_frequency_hz,
             vram_size / 1024 / 1024,
             gart_size / 1024 / 1024
         );
@@ -1341,9 +1641,8 @@ impl WslDxgDevice {
         Ok(dev)
     }
 
-    fn find_amd_adapter() -> Result<(D3DKMT_HANDLE, u32, u32), String> {
-        // Probe /dev/dxg for diagnostics only. Avoid making a successful open a
-        // hard precondition here: libdxcore/libdxg manages its own dxg handle.
+    fn find_amd_adapter(gpu_id_override: u32) -> Result<(D3DKMT_HANDLE, u32, u32), String> {
+        // Hard precondition: /dev/dxg must be present and openable.
         let dxg_probe_fd = unsafe {
             let path = std::ffi::CString::new("/dev/dxg").unwrap();
             libc::open(path.as_ptr(), libc::O_RDWR)
@@ -1354,25 +1653,26 @@ impl WslDxgDevice {
                 libc::close(dxg_probe_fd);
             }
         } else {
-            dxg_debug!(
-                "[DEBUG] /dev/dxg probe failed: {}. Continuing with libdxcore-managed path.",
+            return Err(format!(
+                "/dev/dxg probe failed: {}",
                 std::io::Error::last_os_error()
-            );
+            ));
         }
 
-        if let Some(found) = Self::find_amd_adapter_via_enum2() {
+        if let Some(found) = Self::find_amd_adapter_via_enum2(gpu_id_override) {
             return Ok(found);
         }
-
-        dxg_debug!("[DEBUG] EnumAdapters2 did not yield an AMD adapter, trying EnumAdapters3...");
-        if let Some(found) = Self::find_amd_adapter_via_enum3() {
-            return Ok(found);
+        if gpu_id_override != 0 {
+            Err(format!(
+                "No AMD GPU found via EnumAdapters2 matching device_id=0x{:04X}",
+                gpu_id_override
+            ))
+        } else {
+            Err("No AMD GPU found via EnumAdapters2".to_string())
         }
-
-        Err("No AMD GPU found via EnumAdapters2/3".to_string())
     }
 
-    fn find_amd_adapter_via_enum2() -> Option<(D3DKMT_HANDLE, u32, u32)> {
+    fn find_amd_adapter_via_enum2(gpu_id_override: u32) -> Option<(D3DKMT_HANDLE, u32, u32)> {
         let mut enum_adapters = D3DKMT_ENUMADAPTERS2 {
             NumAdapters: 0,
             pAdapters: ptr::null_mut(),
@@ -1402,10 +1702,10 @@ impl WslDxgDevice {
             return None;
         }
 
-        Self::pick_amd_adapter(&adapters[..enum_adapters_filled.NumAdapters as usize])
+        Self::pick_amd_adapter(&adapters[..enum_adapters_filled.NumAdapters as usize], gpu_id_override)
     }
 
-    fn find_amd_adapter_via_enum3() -> Option<(D3DKMT_HANDLE, u32, u32)> {
+    fn find_amd_adapter_via_enum3(gpu_id_override: u32) -> Option<(D3DKMT_HANDLE, u32, u32)> {
         // Include compute-only, display-only and virtual GPU adapters.
         let filter = (1u64 << 0) | (1u64 << 1) | (1u64 << 2);
         let mut enum_adapters = D3DKMT_ENUMADAPTERS3 {
@@ -1440,10 +1740,15 @@ impl WslDxgDevice {
             return None;
         }
 
-        Self::pick_amd_adapter(&adapters[..enum_adapters_filled.NumAdapters as usize])
+        Self::pick_amd_adapter(&adapters[..enum_adapters_filled.NumAdapters as usize], gpu_id_override)
     }
 
-    fn pick_amd_adapter(adapters: &[D3DKMT_ADAPTERINFO]) -> Option<(D3DKMT_HANDLE, u32, u32)> {
+    fn pick_amd_adapter(
+        adapters: &[D3DKMT_ADAPTERINFO],
+        gpu_id_override: u32,
+    ) -> Option<(D3DKMT_HANDLE, u32, u32)> {
+        let mut first_amd: Option<(D3DKMT_HANDLE, u32, u32)> = None;
+        let mut preferred_gfx12: Option<(D3DKMT_HANDLE, u32, u32)> = None;
         for (i, adapter) in adapters.iter().enumerate() {
             let mut device_ids = D3DKMT_QUERY_DEVICE_IDS::default();
             let query = D3DKMT_QUERYADAPTERINFO {
@@ -1461,15 +1766,36 @@ impl WslDxgDevice {
                 device_ids.DeviceIds.VendorID,
                 device_ids.DeviceIds.DeviceID
             );
-            if qstatus == 0 && device_ids.DeviceIds.VendorID == 0x1002 {
-                return Some((
-                    adapter.hAdapter,
-                    device_ids.DeviceIds.VendorID,
-                    device_ids.DeviceIds.DeviceID,
-                ));
+            if qstatus != 0 || device_ids.DeviceIds.VendorID != 0x1002 {
+                continue;
+            }
+
+            let candidate = (
+                adapter.hAdapter,
+                device_ids.DeviceIds.VendorID,
+                device_ids.DeviceIds.DeviceID,
+            );
+
+            if gpu_id_override != 0 && device_ids.DeviceIds.DeviceID == gpu_id_override {
+                dxg_debug!(
+                    "[DEBUG] Selected AMD adapter by override: device=0x{:04X}",
+                    device_ids.DeviceIds.DeviceID
+                );
+                return Some(candidate);
+            }
+
+            // Prefer known gfx1201 class device IDs when no explicit override is provided.
+            if gpu_id_override == 0 && matches!(device_ids.DeviceIds.DeviceID, 0x7550 | 0x7551) {
+                preferred_gfx12 = Some(candidate);
+            }
+            if first_amd.is_none() {
+                first_amd = Some(candidate);
             }
         }
-        None
+        if gpu_id_override != 0 {
+            return None;
+        }
+        preferred_gfx12.or(first_amd)
     }
 
     fn build_context_priv_data(device_info: &DxgThunkDeviceInfo) -> Result<Vec<u8>, String> {
@@ -1688,8 +2014,68 @@ impl WslDxgDevice {
         ))
     }
 
-    fn create_hw_queue(&self) -> Result<(D3DKMT_HANDLE, D3DKMT_HANDLE, *mut u64), String> {
-        if !self.compute_hws_enabled {
+    fn create_compute_context(&self) -> Result<D3DKMT_HANDLE, String> {
+        let mut context_flags = 0u32;
+        if self.compute_hws_enabled || dxg_force_hw_queue() {
+            context_flags |= D3DDDI_CREATECONTEXTFLAGS_HW_QUEUE_SUPPORTED;
+        } else if self.device_info.should_disable_gpu_timeout(self.compute_engine)? {
+            context_flags |= D3DDDI_CREATECONTEXTFLAGS_DISABLE_GPU_TIMEOUT;
+        }
+
+        let mut context_priv_data = Self::build_context_priv_data(&self.device_info)?;
+        let mut create_context = D3DKMT_CREATECONTEXTVIRTUAL {
+            hDevice: self.dxg_device,
+            NodeOrdinal: self.compute_node_ordinal,
+            EngineAffinity: 1,
+            Flags: D3DDDI_CREATECONTEXTFLAGS { Value: context_flags },
+            pPrivateDriverData: context_priv_data.as_mut_ptr() as *mut c_void,
+            PrivateDriverDataSize: context_priv_data.len() as u32,
+            ClientHint: D3DKMT_CLIENTHINT_OPENCL,
+            ..Default::default()
+        };
+        let status = unsafe { D3DKMTCreateContextVirtual(&mut create_context) };
+        if nt_failed(status) {
+            return Err(format!("D3DKMTCreateContextVirtual failed: 0x{:08X}", status as u32));
+        }
+        Ok(create_context.hContext)
+    }
+
+    fn set_power_optimization(
+        adapter: D3DKMT_HANDLE,
+        device: D3DKMT_HANDLE,
+        restore: bool,
+    ) {
+        if adapter == 0 || device == 0 {
+            return;
+        }
+
+        let mut priv_data = thunk_proxy::build_power_opt_priv_data(restore);
+        let escape = D3DKMT_ESCAPE {
+            hAdapter: adapter,
+            hDevice: device,
+            Type: D3DKMT_ESCAPETYPE::DriverPrivate,
+            Flags: D3DDDI_ESCAPEFLAGS { Value: 0x1 },
+            pPrivateDriverData: priv_data.as_mut_ptr() as *mut c_void,
+            PrivateDriverDataSize: priv_data.len() as u32,
+            hContext: 0,
+        };
+        let status = unsafe { D3DKMTEscape(&escape) };
+        if nt_failed(status) {
+            eprintln!(
+                "[DXG] WARN: D3DKMTEscape(power_opt restore={}) failed: 0x{:08X}",
+                restore,
+                status as u32,
+            );
+        } else {
+            dxg_debug!("[DXG] power optimization restore={} applied", restore);
+        }
+    }
+
+    fn create_hw_queue(
+        &self,
+        context: D3DKMT_HANDLE,
+    ) -> Result<(D3DKMT_HANDLE, D3DKMT_HANDLE, *mut u64), String> {
+        if !self.compute_hws_enabled && !dxg_force_hw_queue() {
             return Err(format!(
                 "Compute engine {} does not expose HWS on this adapter",
                 self.compute_engine
@@ -1701,9 +2087,9 @@ impl WslDxgDevice {
             thunk_proxy::DxgSchedLevel::Normal,
         );
         let mut create = D3DKMT_CREATEHWQUEUE {
-            hHwContext: self.dxg_context,
+            hHwContext: context,
             Flags: D3DDDI_CREATEHWQUEUEFLAGS {
-                Value: if self.device_info.should_disable_gpu_timeout(self.compute_engine) {
+                Value: if self.device_info.should_disable_gpu_timeout(self.compute_engine)? {
                     1
                 } else {
                     0
@@ -1740,6 +2126,20 @@ impl WslDxgDevice {
         }
     }
 
+    fn destroy_context(&self, context: D3DKMT_HANDLE) {
+        if context == 0 {
+            return;
+        }
+        let args = D3DKMT_DESTROYCONTEXT { hContext: context };
+        let status = unsafe { D3DKMTDestroyContext(&args) };
+        if nt_failed(status) {
+            eprintln!(
+                "[DXG] WARN: D3DKMTDestroyContext failed: 0x{:08X}",
+                status as u32
+            );
+        }
+    }
+
     fn reserve_gpu_virtual_address(&self, size: usize) -> Result<u64, String> {
         let mut args = D3DDDI_RESERVEGPUVIRTUALADDRESS {
             hAdapter: self.dxg_adapter,
@@ -1765,6 +2165,11 @@ impl WslDxgDevice {
             return Ok(());
         }
 
+        dxg_debug!(
+            "[DXG] wait_for_sync_object_value begin: sync_object={} fence_value={}",
+            sync_object,
+            fence_value
+        );
         let handles = [sync_object];
         let fence_values = [fence_value];
         let args = D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU {
@@ -1782,6 +2187,41 @@ impl WslDxgDevice {
                 status as u32
             ));
         }
+        dxg_debug!(
+            "[DXG] wait_for_sync_object_value done: sync_object={} fence_value={}",
+            sync_object,
+            fence_value
+        );
+        Ok(())
+    }
+
+    fn wait_for_sync_object_value_from_gpu(
+        &self,
+        context: D3DKMT_HANDLE,
+        sync_object: D3DKMT_HANDLE,
+        fence_value: u64,
+    ) -> Result<(), String> {
+        if context == 0 || sync_object == 0 || fence_value == 0 {
+            return Ok(());
+        }
+
+        let handles = [sync_object];
+        let fence_values = [fence_value];
+        let mut data = D3DKMT_WAITSYNCFGPU_DATA::default();
+        data.MonitoredFenceValueArray = fence_values.as_ptr();
+        let args = D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU {
+            hContext: context,
+            ObjectCount: 1,
+            ObjectHandleArray: handles.as_ptr(),
+            data,
+        };
+        let status = unsafe { D3DKMTWaitForSynchronizationObjectFromGpu(&args) };
+        if nt_failed(status) {
+            return Err(format!(
+                "D3DKMTWaitForSynchronizationObjectFromGpu failed: 0x{:08X}",
+                status as u32
+            ));
+        }
         Ok(())
     }
 
@@ -1789,13 +2229,27 @@ impl WslDxgDevice {
         if fence_value == 0 {
             return Ok(());
         }
-        self.paging_fence_value
-            .store(fence_value, std::sync::atomic::Ordering::Relaxed);
+        self.record_paging_fence_value(fence_value);
         self.wait_for_sync_object_value(self.dxg_paging_sync_object, fence_value)
     }
 
-    fn submit_command_to_hw_queue(
+    fn wait_on_latest_paging_fence_from_gpu(&self, context: D3DKMT_HANDLE) -> Result<(), String> {
+        let fence_value = self.paging_fence_value.load(std::sync::atomic::Ordering::Relaxed);
+        if fence_value == 0 {
+            return Ok(());
+        }
+        if !self.dxg_paging_fence_cpu_va.is_null() {
+            let completed = unsafe { ptr::read_volatile(self.dxg_paging_fence_cpu_va) };
+            if completed >= fence_value {
+                return Ok(());
+            }
+        }
+        self.wait_for_sync_object_value_from_gpu(context, self.dxg_paging_sync_object, fence_value)
+    }
+
+    fn submit_command_to_hw_queue_on_context(
         &self,
+        context: D3DKMT_HANDLE,
         hw_queue: D3DKMT_HANDLE,
         command_buffer: u64,
         command_length: u32,
@@ -1807,6 +2261,7 @@ impl WslDxgDevice {
             command_length,
             true,
         );
+        self.wait_on_latest_paging_fence_from_gpu(context)?;
         let args = D3DKMT_SUBMITCOMMANDTOHWQUEUE {
             hHwQueue: hw_queue,
             HwQueueProgressFenceId: fence_value,
@@ -1827,15 +2282,39 @@ impl WslDxgDevice {
         Ok(())
     }
 
-    fn submit_command(
+    fn submit_command_to_hw_queue(
         &self,
+        hw_queue: D3DKMT_HANDLE,
+        command_buffer: u64,
+        command_length: u32,
+        fence_value: u64,
+    ) -> Result<(), String> {
+        self.submit_command_to_hw_queue_on_context(
+            self.dxg_context,
+            hw_queue,
+            command_buffer,
+            command_length,
+            fence_value,
+        )
+    }
+
+    fn submit_command_on_context(
+        &self,
+        context: D3DKMT_HANDLE,
+        submit_queue_handle: D3DKMT_HANDLE,
         command_buffer: u64,
         command_length: u32,
         progress_sync_object: D3DKMT_HANDLE,
         fence_value: u64,
     ) -> Result<(), String> {
         let mut priv_data =
-            thunk_proxy::build_submit_priv_data(0, command_buffer, command_length, false);
+            thunk_proxy::build_submit_priv_data(
+                submit_queue_handle,
+                command_buffer,
+                command_length,
+                false,
+            );
+        self.wait_on_latest_paging_fence_from_gpu(context)?;
         let mut args = D3DKMT_SUBMITCOMMAND {
             Commands: command_buffer,
             CommandLength: command_length,
@@ -1850,14 +2329,31 @@ impl WslDxgDevice {
             NumHistoryBuffers: 0,
             HistoryBufferArray: ptr::null_mut(),
         };
-        args.BroadcastContext[0] = self.dxg_context;
+        args.BroadcastContext[0] = context;
 
         let status = unsafe { D3DKMTSubmitCommand(&args) };
         if nt_failed(status) {
             return Err(format!("D3DKMTSubmitCommand failed: 0x{:08X}", status as u32));
         }
 
-        self.signal_sync_object_from_gpu(progress_sync_object, fence_value)
+        self.signal_sync_object_from_gpu_on_context(context, progress_sync_object, fence_value)
+    }
+
+    fn submit_command(
+        &self,
+        command_buffer: u64,
+        command_length: u32,
+        progress_sync_object: D3DKMT_HANDLE,
+        fence_value: u64,
+    ) -> Result<(), String> {
+        self.submit_command_on_context(
+            self.dxg_context,
+            0,
+            command_buffer,
+            command_length,
+            progress_sync_object,
+            fence_value,
+        )
     }
 
     fn query_execution_state(&self) -> Result<u32, String> {
@@ -1925,18 +2421,23 @@ impl WslDxgDevice {
         format!("{execution} {reset} {page_fault}")
     }
 
-    fn signal_sync_object_from_gpu(
+    fn signal_sync_object_from_gpu_on_context(
         &self,
+        context: D3DKMT_HANDLE,
         sync_object: D3DKMT_HANDLE,
         fence_value: u64,
     ) -> Result<(), String> {
         let handles = [sync_object];
         let values = [fence_value];
+        let mut data = D3DKMT_SIGNALSYNCFGPU_DATA::default();
+        unsafe {
+            data.MonitoredFenceValueArray = values.as_ptr();
+        }
         let args = D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU {
-            hContext: self.dxg_context,
+            hContext: context,
             ObjectCount: 1,
             ObjectHandleArray: handles.as_ptr(),
-            MonitoredFenceValueArray: values.as_ptr(),
+            data,
         };
         let status = unsafe { D3DKMTSignalSynchronizationObjectFromGpu(&args) };
         if nt_failed(status) {
@@ -1946,6 +2447,14 @@ impl WslDxgDevice {
             ));
         }
         Ok(())
+    }
+
+    fn signal_sync_object_from_gpu(
+        &self,
+        sync_object: D3DKMT_HANDLE,
+        fence_value: u64,
+    ) -> Result<(), String> {
+        self.signal_sync_object_from_gpu_on_context(self.dxg_context, sync_object, fence_value)
     }
 
     fn free_gpu_virtual_address(&self, gpu_va: u64, size: usize) {
@@ -2011,6 +2520,7 @@ impl WslDxgDevice {
             let _ = D3DKMTDestroyPagingQueue(&args);
         }
         if device != 0 {
+            Self::set_power_optimization(adapter, device, true);
             let args = D3DKMT_DESTROYDEVICE { hDevice: device };
             let _ = D3DKMTDestroyDevice(&args);
         }
@@ -2321,7 +2831,17 @@ impl WslDxgDevice {
         let (cpu_ptr, cpu_locked) = if !sys_mem.is_null() {
             (sys_mem as *mut u8, false)
         } else if matches!(alloc_domain, T0DxgAllocDomain::Local | T0DxgAllocDomain::UserQueue) {
-            (map_gpu_va as *mut u8, false)
+            match self.lock_allocation(handle) {
+                Ok(ptr) => (ptr as *mut u8, true),
+                Err(err) => {
+                    self.destroy_allocation_handle(handle);
+                    self.local_heap.free(reserved_gpu_va, aligned_size as u64);
+                    return Err(format!(
+                        "Failed to CPU-map local/user-queue allocation {}: {}",
+                        handle, err
+                    ));
+                }
+            }
         } else {
             (ptr::null_mut(), false)
         };
@@ -2402,6 +2922,7 @@ impl WslDxgDevice {
             ..Default::default()
         };
         unsafe {
+            info.info.MonitoredFence.InitialFenceValue = 0;
             info.info.MonitoredFence.EngineAffinity = 1;
         }
 
@@ -2417,9 +2938,22 @@ impl WslDxgDevice {
                 status as u32
             ));
         }
+        let sync_cpu_va = unsafe { create.Info.info.MonitoredFence.FenceValueCPUVirtualAddress as *mut u64 };
+        let sync_gpu_va = unsafe { create.Info.info.MonitoredFence.FenceValueGPUVirtualAddress };
+        dxg_debug!(
+            "[DXG] create_monitored_fence: hSyncObject={} cpu_va={:?} gpu_va=0x{:016X} initial_cpu_value={}",
+            create.hSyncObject,
+            sync_cpu_va,
+            sync_gpu_va,
+            if sync_cpu_va.is_null() {
+                u64::MAX
+            } else {
+                unsafe { ptr::read_volatile(sync_cpu_va) }
+            }
+        );
         Ok((
             create.hSyncObject,
-            unsafe { create.Info.info.MonitoredFence.FenceValueCPUVirtualAddress as *mut u64 },
+            sync_cpu_va,
         ))
     }
 
@@ -2438,11 +2972,11 @@ impl WslDxgDevice {
     }
 
     pub fn wait_sync(&self, sync_object: D3DKMT_HANDLE, timeout_ns: u64) -> Result<(), String> {
+        let _ = timeout_ns;
         let mut wait = D3DKMT_WAITFORSYNCHRONIZATIONOBJECT2 {
             hContext: self.dxg_context,
             ObjectCount: 1,
             ObjectHandleArray: [sync_object; 32], // Will use only first ObjectCount
-            Timeout: timeout_ns,
             ..Default::default()
         };
         // Zero out the rest of the array
@@ -2482,7 +3016,7 @@ impl WslDxgDevice {
     pub fn create_queue_sized(self: &Arc<Self>, ring_size: u32) -> Result<WslAqlQueue, String> {
         assert!(ring_size.is_power_of_two(), "ring_size must be power of 2, got {}", ring_size);
 
-        let ring_buffer = self.alloc_uncached(ring_size as usize)?;
+        let ring_buffer = self.alloc_system(ring_size as usize)?;
 
         unsafe {
             ptr::write_bytes(ring_buffer.cpu_ptr, 0, ring_buffer.size);
@@ -2493,26 +3027,64 @@ impl WslDxgDevice {
             }
         }
 
-        let cmd_buffer = self.alloc_uncached(DXG_HW_QUEUE_FRAME_SIZE * DXG_HW_QUEUE_FRAME_COUNT as usize)?;
+        let cmd_buffer = self.alloc_system(DXG_HW_QUEUE_FRAME_SIZE * DXG_HW_QUEUE_FRAME_COUNT as usize)?;
         cmd_buffer.zero();
 
+        let queue_context = match self.create_compute_context() {
+            Ok(context) => context,
+            Err(err) => return Err(err),
+        };
+
         let force_sw_queue = std::env::var_os("T0_DXG_FORCE_SW_QUEUE").is_some();
+        let force_hw_queue = dxg_force_hw_queue();
         let (use_hw_queue, hw_queue, hw_queue_progress_fence, hw_queue_progress_fence_cpu_va) =
-            if self.compute_hws_enabled && !force_sw_queue {
-                let (hw_queue, progress_fence, progress_cpu_va) = self.create_hw_queue()?;
-                (true, hw_queue, progress_fence, progress_cpu_va)
+            if (self.compute_hws_enabled || force_hw_queue) && !force_sw_queue {
+                match self.create_hw_queue(queue_context) {
+                    Ok((hw_queue, progress_fence, progress_cpu_va)) => {
+                        (true, hw_queue, progress_fence, progress_cpu_va)
+                    }
+                    Err(err) => {
+                        self.destroy_context(queue_context);
+                        return Err(err);
+                    }
+                }
             } else {
-                let (sync_object, sync_cpu_va) = self.create_monitored_fence()?;
-                (false, 0, sync_object, sync_cpu_va)
+                match self.create_monitored_fence() {
+                    Ok((sync_object, sync_cpu_va)) => (false, 0, sync_object, sync_cpu_va),
+                    Err(err) => {
+                        self.destroy_context(queue_context);
+                        return Err(err);
+                    }
+                }
             };
         dxg_debug!(
-            "[DXG] Queue mode: use_hw_queue={} compute_hws_enabled={} force_sw_queue={}",
+            "[DXG] Queue mode: use_hw_queue={} compute_hws_enabled={} force_hw_queue={} force_sw_queue={}",
             use_hw_queue,
             self.compute_hws_enabled,
+            force_hw_queue,
             force_sw_queue
         );
-        let queue_id = if use_hw_queue { hw_queue as u64 } else { 0 };
-        let amd_queue_mem = self.alloc_gart(PAGE_SIZE)?;
+        // Match librocdxg default behavior:
+        // SW queue submit uses queue handle 0 unless UMD queue alloc is explicitly enabled.
+        let sw_queue_mem = None;
+        let sw_queue_handle = 0;
+        let queue_id = if use_hw_queue {
+            hw_queue as u64
+        } else {
+            0
+        };
+        let amd_queue_mem = match self.alloc_system(PAGE_SIZE) {
+            Ok(mem) => mem,
+            Err(err) => {
+                if use_hw_queue {
+                    self.destroy_hw_queue(hw_queue);
+                } else {
+                    self.destroy_sync_object(hw_queue_progress_fence);
+                }
+                self.destroy_context(queue_context);
+                return Err(err);
+            }
+        };
         amd_queue_mem.zero();
         let write_ptr_host = unsafe {
             let amd_queue_ptr = amd_queue_mem.cpu_ptr as *mut AmdQueueV2;
@@ -2528,28 +3100,38 @@ impl WslDxgDevice {
             let amd_queue_ptr = amd_queue_mem.cpu_ptr as *mut AmdQueueV2;
             ptr::addr_of_mut!((*amd_queue_ptr).read_dispatch_id)
         };
+        let read_ptr_gpu_va =
+            amd_queue_mem.gpu_va + std::mem::offset_of!(AmdQueueV2, read_dispatch_id) as u64;
         let worker_state = Arc::new(WslQueueWorkerState::new());
         let worker_thread = {
             let worker_state = Arc::clone(&worker_state);
             let device = Arc::clone(self);
             let ring_buffer_ptr = ring_buffer.cpu_ptr as usize;
+            let ring_buffer_gpu_va = ring_buffer.gpu_va;
             let write_ptr_host = write_ptr_host as usize;
             let read_ptr_host = read_ptr_host as usize;
             let cmd_buffer_cpu_ptr = cmd_buffer.cpu_ptr as usize;
             let cmd_buffer_gpu_va = cmd_buffer.gpu_va;
             let hw_queue_progress_fence_cpu_va = hw_queue_progress_fence_cpu_va as usize;
             let amd_queue_gpu_va = amd_queue_mem.gpu_va;
+            let scratch_base_gpu_va = 0u64;
             let device_major = self.device_info.major();
+            let sw_queue_handle = sw_queue_handle;
             Some(std::thread::spawn(move || {
                 if let Err(err) = run_wsl_queue_worker(
                     Arc::clone(&worker_state),
                     device,
                     use_hw_queue,
                     ring_buffer_ptr as *mut u8,
+                    ring_buffer_gpu_va,
                     ring_size,
                     write_ptr_host as *mut u64,
                     read_ptr_host as *mut u64,
+                    read_ptr_gpu_va,
+                    scratch_base_gpu_va,
+                    queue_context,
                     hw_queue,
+                    sw_queue_handle,
                     hw_queue_progress_fence,
                     hw_queue_progress_fence_cpu_va as *mut u64,
                     cmd_buffer_cpu_ptr as *mut u8,
@@ -2561,6 +3143,7 @@ impl WslDxgDevice {
                 }
             }))
         };
+        let wait_idle_signal = self.alloc_signal()?;
 
         Ok(WslAqlQueue {
             queue_id: if use_hw_queue { hw_queue } else { hw_queue_progress_fence },
@@ -2572,13 +3155,17 @@ impl WslDxgDevice {
             doorbell_mmap_base: ptr::null_mut(),
             doorbell_mmap_size: 0,
             use_hw_queue,
+            queue_context,
             hw_queue,
             hw_queue_progress_fence,
             hw_queue_progress_fence_cpu_va,
             worker_state,
             worker_thread,
+            wait_idle_signal,
+            _sw_queue_mem: sw_queue_mem,
             _amd_queue_mem: amd_queue_mem,
             _cmd_buffer: cmd_buffer,
+            _scratch_mem: None,
             device: Arc::clone(self),
         })
     }
@@ -2590,11 +3177,16 @@ impl WslDxgDevice {
             vram: true,
             writable: true,
             public: true,
+            coherent: true,
+            fine_grain: true,
             ..Default::default()
         })
     }
 
     pub fn alloc_code(self: &Arc<Self>, size: usize) -> Result<WslGpuMemory, String> {
+        // Current gfx1201 + /dev/dxg path does not provide a valid LOCAL Lock2
+        // CPU mapping on this setup (D3DKMTLock2 -> STATUS_INVALID_PARAMETER).
+        // Keep code objects in host-visible system memory as an explicit policy.
         self.alloc_memory(size, MemoryFlags {
             vram: true,
             writable: true,
@@ -2602,6 +3194,14 @@ impl WslDxgDevice {
             public: true,
             ..Default::default()
         })
+    }
+
+    pub(crate) fn alloc_system(self: &Arc<Self>, size: usize) -> Result<WslGpuMemory, String> {
+        self.alloc_memory_in_domain(size, MemoryFlags {
+            writable: true,
+            public: true,
+            ..Default::default()
+        }, T0DxgAllocDomain::System)
     }
 
     pub fn alloc_gart(self: &Arc<Self>, size: usize) -> Result<WslGpuMemory, String> {
@@ -2889,7 +3489,6 @@ impl WslPm4CmdBuilder {
 
     fn compute_barrier(&mut self) {
         self.event_write(CS_PARTIAL_FLUSH, EVENT_INDEX_PARTIAL_FLUSH);
-        self.acquire_mem_gfx10();
     }
 
     fn dispatch_direct(&mut self, grid: [u32; 3]) {
@@ -2900,11 +3499,32 @@ impl WslPm4CmdBuilder {
         self.pkt3(PM4_DISPATCH_DIRECT, &[grid[0], grid[1], grid[2], initiator]);
     }
 
+    fn copy_gpu_clock_count(&mut self, addr: u64) {
+        assert_eq!(
+            addr & 0x7,
+            0,
+            "COPY_DATA timestamp destination must be 8-byte aligned: 0x{addr:016X}"
+        );
+        let control_dw =
+            9 |
+            (2 << 8) |
+            (1 << 16) |
+            (1 << 20) |
+            (1 << 25);
+        // NOTE:
+        // PM4 COPY_DATA destination address here is emitted as the raw ordinal field.
+        // Using the bitfield-style pre-shift (>>3) produced GPU page faults on gfx1201
+        // because hardware consumed the ordinal value as a byte address in this path.
+        let addr_lo = addr as u32;
+        let addr_hi = (addr >> 32) as u32;
+        self.pkt3(PM4_COPY_DATA, &[control_dw, 0, 0, addr_lo, addr_hi]);
+    }
+
     fn write_data_64(&mut self, addr: u64, value: u64) {
         let control_dw =
             (5 << 8)  // dst_sel = memory
             | (1 << 20) // wr_confirm = wait for write confirmation
-            | (3 << 24); // cache_policy = bypass
+            | (3 << 25); // cache_policy = bypass
         let addr_lo = (addr as u32) >> 2;
         let addr_hi = (addr >> 32) as u32;
         self.pkt3(PM4_WRITE_DATA, &[
@@ -2974,10 +3594,11 @@ fn build_dispatch_pm4(
     packet: &AqlDispatchPacket,
     read_ptr_gpu_va: u64,
     completed_read_idx: u64,
+    scratch_base_gpu_va: u64,
     queue_va: u64,
     packet_gpu_va: u64,
     device_major: u32,
-    cpu_progress_updates: bool,
+    platform_atomic_support: bool,
 ) -> Result<Vec<u32>, String> {
     if packet.kernel_object == 0 {
         return Err("AQL dispatch packet has null kernel_object".to_string());
@@ -3000,6 +3621,7 @@ fn build_dispatch_pm4(
         unsafe { ptr::read_volatile(kd_ptr.add(KD_COMPUTE_PGM_RSRC3_OFFSET) as *const u32) };
     let kernel_code_properties =
         unsafe { ptr::read_volatile(kd_ptr.add(KD_KERNEL_CODE_PROPERTIES_OFFSET) as *const u16) };
+    let enable_profile_timestamps = (packet.reserved2 & AQL_RESERVED2_PROFILE_TS) != 0;
 
     if packet.group_segment_size < kd_group_segment_size {
         return Err(format!(
@@ -3029,6 +3651,13 @@ fn build_dispatch_pm4(
         (kernel_code_properties & AMD_KERNEL_CODE_PROPERTIES_ENABLE_WAVEFRONT_SIZE32) != 0;
     let dynamic_lds_blocks = lds_blocks(packet.group_segment_size);
     let wgp_mode = ((rsrc1 >> 29) & 1) != 0;
+    if wgp_mode && device_major <= 11 && !dxg_allow_wgp_legacy() {
+        return Err(
+            "WGP mode dispatch is blocked on legacy gfx11 DXG path by default (known hang risk); \
+             set T0_DXG_ALLOW_WGP_LEGACY=1 to force-enable"
+                .to_string(),
+        );
+    }
     let max_lds_blocks = if wgp_mode { 256 } else { 128 };
     if dynamic_lds_blocks > max_lds_blocks {
         return Err(format!(
@@ -3040,7 +3669,9 @@ fn build_dispatch_pm4(
     }
     let rsrc2 = rsrc2_base | (dynamic_lds_blocks << 15);
     let rsrc3 = if device_major >= 11 {
-        rsrc3_base | COMPUTE_PGM_RSRC3_IMAGE_OP
+        // Match librocdxg CmdUtil::BuildComputeShaderParams (gfx11+):
+        // program RSRC3 as IMAGE_OP-only in PM4 dispatch stream.
+        COMPUTE_PGM_RSRC3_IMAGE_OP
     } else {
         rsrc3_base
     };
@@ -3088,7 +3719,11 @@ fn build_dispatch_pm4(
     }
 
     let mut pm4 = WslPm4CmdBuilder::new();
-    let use_atomic_progress = dxg_platform_atomic_enabled();
+    let use_atomic_progress = platform_atomic_support;
+
+    if packet.completion_signal != 0 && enable_profile_timestamps {
+        pm4.copy_gpu_clock_count(packet.completion_signal + AMD_SIGNAL_START_TS_OFFSET as u64);
+    }
 
     if packet.header & HSA_PACKET_HEADER_BARRIER_BIT != 0 {
         pm4.compute_barrier();
@@ -3096,7 +3731,10 @@ fn build_dispatch_pm4(
 
     pm4.acquire_mem_gfx10();
     if device_major >= 11 {
-        pm4.set_sh_reg(REG_COMPUTE_DISPATCH_SCRATCH_BASE_LO, &[0, 0]);
+        pm4.set_sh_reg(
+            REG_COMPUTE_DISPATCH_SCRATCH_BASE_LO,
+            &[ptr48_low32(scratch_base_gpu_va), ptr48_high8(scratch_base_gpu_va)],
+        );
         pm4.set_sh_reg(REG_COMPUTE_PGM_RSRC3, &[rsrc3]);
     }
     pm4.set_sh_reg(REG_COMPUTE_NUM_THREAD_X, &[
@@ -3109,11 +3747,14 @@ fn build_dispatch_pm4(
         ptr48_high8(code_entry_va),
     ]);
     pm4.set_sh_reg(REG_COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]);
+    // mmCOMPUTE_RESOURCE_LIMITS..mmCOMPUTE_STATIC_THREAD_MGMT_SE3 are programmed as
+    // one contiguous SET_SH_REG burst. Register order must match HW:
+    //   RESOURCE_LIMITS, SE0, SE1, TMPRING_SIZE, SE2, SE3.
     pm4.set_sh_reg(REG_COMPUTE_RESOURCE_LIMITS, &[
         COMPUTE_RESOURCE_LIMITS_DEFAULT,
         COMPUTE_STATIC_THREAD_MGMT_ENABLE_ALL,
         COMPUTE_STATIC_THREAD_MGMT_ENABLE_ALL,
-        0,
+        0, // COMPUTE_TMPRING_SIZE
         COMPUTE_STATIC_THREAD_MGMT_ENABLE_ALL,
         COMPUTE_STATIC_THREAD_MGMT_ENABLE_ALL,
     ]);
@@ -3132,33 +3773,24 @@ fn build_dispatch_pm4(
         dispatch_initiator,
     );
 
-    if cpu_progress_updates {
-        if packet.completion_signal != 0 {
-            pm4.compute_barrier();
+    if packet.completion_signal != 0 {
+        pm4.compute_barrier();
+        if enable_profile_timestamps {
+            pm4.copy_gpu_clock_count(packet.completion_signal + AMD_SIGNAL_END_TS_OFFSET as u64);
         }
-    } else {
-        if packet.completion_signal != 0 {
-            pm4.compute_barrier();
-            if use_atomic_progress {
-                pm4.atomic_add_64(
-                    packet.completion_signal + 8,
-                    u64::MAX,
-                    MEC_ATOMIC_MEM_CACHE_POLICY_BYPASS,
-                );
-            } else {
-                emit_non_atomic_progress_store(
-                    &mut pm4,
-                    device_major,
-                    packet.completion_signal + 8,
-                    0,
-                );
-            }
-        }
+        pm4.acquire_mem_gfx10();
         if use_atomic_progress {
-            pm4.atomic_add_64(read_ptr_gpu_va, 1, MEC_ATOMIC_MEM_CACHE_POLICY_STREAM);
-        } else {
-            emit_non_atomic_progress_store(&mut pm4, device_major, read_ptr_gpu_va, completed_read_idx);
+            pm4.atomic_add_64(
+                packet.completion_signal + AMD_SIGNAL_VALUE_OFFSET as u64,
+                u64::MAX,
+                MEC_ATOMIC_MEM_CACHE_POLICY_BYPASS,
+            );
         }
+    }
+    if use_atomic_progress {
+        pm4.atomic_add_64(read_ptr_gpu_va, 1, MEC_ATOMIC_MEM_CACHE_POLICY_STREAM);
+    } else {
+        emit_non_atomic_progress_store(&mut pm4, device_major, read_ptr_gpu_va, completed_read_idx);
     }
 
     Ok(pm4.finish())
@@ -3178,30 +3810,24 @@ fn build_barrier_pm4(
     read_ptr_gpu_va: u64,
     completed_read_idx: u64,
     device_major: u32,
-    cpu_progress_updates: bool,
+    platform_atomic_support: bool,
 ) -> Vec<u32> {
     let mut pm4 = WslPm4CmdBuilder::new();
-    let use_atomic_progress = dxg_platform_atomic_enabled();
-    if cpu_progress_updates {
+    let use_atomic_progress = platform_atomic_support;
+    if completion_signal != 0 {
         pm4.compute_barrier();
-    } else {
-        if completion_signal != 0 {
-            pm4.compute_barrier();
-            if use_atomic_progress {
-                pm4.atomic_add_64(
-                    completion_signal + 8,
-                    u64::MAX,
-                    MEC_ATOMIC_MEM_CACHE_POLICY_BYPASS,
-                );
-            } else {
-                emit_non_atomic_progress_store(&mut pm4, device_major, completion_signal + 8, 0);
-            }
-        }
         if use_atomic_progress {
-            pm4.atomic_add_64(read_ptr_gpu_va, 1, MEC_ATOMIC_MEM_CACHE_POLICY_STREAM);
-        } else {
-            emit_non_atomic_progress_store(&mut pm4, device_major, read_ptr_gpu_va, completed_read_idx);
+            pm4.atomic_add_64(
+                completion_signal + AMD_SIGNAL_VALUE_OFFSET as u64,
+                u64::MAX,
+                MEC_ATOMIC_MEM_CACHE_POLICY_BYPASS,
+            );
         }
+    }
+    if use_atomic_progress {
+        pm4.atomic_add_64(read_ptr_gpu_va, 1, MEC_ATOMIC_MEM_CACHE_POLICY_STREAM);
+    } else {
+        emit_non_atomic_progress_store(&mut pm4, device_major, read_ptr_gpu_va, completed_read_idx);
     }
     pm4.finish()
 }
@@ -3211,7 +3837,7 @@ fn build_vendor_specific_pm4(
     read_ptr_gpu_va: u64,
     completed_read_idx: u64,
     device_major: u32,
-    cpu_progress_updates: bool,
+    platform_atomic_support: bool,
 ) -> Result<Vec<u32>, String> {
     let ib_jump_header = packet.ib_jump_cmd[0];
     let pkt_type = ib_jump_header >> 30;
@@ -3256,34 +3882,21 @@ fn build_vendor_specific_pm4(
     }
 
     let mut tail = WslPm4CmdBuilder::new();
-    let use_atomic_progress = dxg_platform_atomic_enabled();
-    if cpu_progress_updates {
-        if packet.completion_signal != 0 {
-            tail.compute_barrier();
-        }
-    } else {
-        if packet.completion_signal != 0 {
-            tail.compute_barrier();
-            if use_atomic_progress {
-                tail.atomic_add_64(
-                    packet.completion_signal + 8,
-                    u64::MAX,
-                    MEC_ATOMIC_MEM_CACHE_POLICY_BYPASS,
-                );
-            } else {
-                emit_non_atomic_progress_store(
-                    &mut tail,
-                    device_major,
-                    packet.completion_signal + 8,
-                    0,
-                );
-            }
-        }
+    let use_atomic_progress = platform_atomic_support;
+    if packet.completion_signal != 0 {
+        tail.compute_barrier();
         if use_atomic_progress {
-            tail.atomic_add_64(read_ptr_gpu_va, 1, MEC_ATOMIC_MEM_CACHE_POLICY_STREAM);
-        } else {
-            emit_non_atomic_progress_store(&mut tail, device_major, read_ptr_gpu_va, completed_read_idx);
+            tail.atomic_add_64(
+                packet.completion_signal + AMD_SIGNAL_VALUE_OFFSET as u64,
+                u64::MAX,
+                MEC_ATOMIC_MEM_CACHE_POLICY_BYPASS,
+            );
         }
+    }
+    if use_atomic_progress {
+        tail.atomic_add_64(read_ptr_gpu_va, 1, MEC_ATOMIC_MEM_CACHE_POLICY_STREAM);
+    } else {
+        emit_non_atomic_progress_store(&mut tail, device_major, read_ptr_gpu_va, completed_read_idx);
     }
     pm4.extend(tail.finish());
 
@@ -3330,10 +3943,15 @@ fn run_wsl_queue_worker(
     device: Arc<WslDxgDevice>,
     use_hw_queue: bool,
     ring_buffer: *mut u8,
+    ring_buffer_gpu_va: u64,
     ring_size: u32,
     write_ptr_host: *mut u64,
     read_ptr_host: *mut u64,
+    read_ptr_gpu_va: u64,
+    scratch_base_gpu_va: u64,
+    queue_context: D3DKMT_HANDLE,
     hw_queue: D3DKMT_HANDLE,
+    submit_queue_handle: D3DKMT_HANDLE,
     hw_queue_progress_fence: D3DKMT_HANDLE,
     hw_queue_progress_fence_cpu_va: *mut u64,
     cmd_buffer_cpu_ptr: *mut u8,
@@ -3346,6 +3964,7 @@ fn run_wsl_queue_worker(
     }
 
     let mut submit_cursor = unsafe { ptr::read_volatile(read_ptr_host) };
+    let platform_atomic_support = device.platform_atomic_support();
 
     loop {
         {
@@ -3381,19 +4000,22 @@ fn run_wsl_queue_worker(
         }
 
         let completed_read_idx = submit_cursor + 1;
-        let cpu_progress_updates = !use_hw_queue && device_major >= 12;
+        let ring_mask = (ring_size as u64 / 64) - 1;
+        let slot_idx = submit_cursor & ring_mask;
+        let packet_gpu_va = ring_buffer_gpu_va + slot_idx * 64;
         let (pm4_cmds, completion_signal) = match packet_type {
             HSA_PACKET_TYPE_KERNEL_DISPATCH => {
                 let packet = unsafe { ptr::read_unaligned(packet_base as *const AqlDispatchPacket) };
                 (
                     build_dispatch_pm4(
                         &packet,
-                        read_ptr_host as u64,
+                        read_ptr_gpu_va,
                         completed_read_idx,
+                        scratch_base_gpu_va,
                         amd_queue_gpu_va,
-                        packet_base as u64,
+                        packet_gpu_va,
                         device_major,
-                        cpu_progress_updates,
+                        platform_atomic_support,
                     )?,
                     packet.completion_signal,
                 )
@@ -3404,10 +4026,10 @@ fn run_wsl_queue_worker(
                 (
                     build_barrier_pm4(
                         packet.completion_signal,
-                        read_ptr_host as u64,
+                        read_ptr_gpu_va,
                         completed_read_idx,
                         device_major,
-                        cpu_progress_updates,
+                        platform_atomic_support,
                     ),
                     packet.completion_signal,
                 )
@@ -3418,10 +4040,10 @@ fn run_wsl_queue_worker(
                 (
                     build_barrier_pm4(
                         packet.completion_signal,
-                        read_ptr_host as u64,
+                        read_ptr_gpu_va,
                         completed_read_idx,
                         device_major,
-                        cpu_progress_updates,
+                        platform_atomic_support,
                     ),
                     packet.completion_signal,
                 )
@@ -3432,10 +4054,10 @@ fn run_wsl_queue_worker(
                 (
                     build_vendor_specific_pm4(
                         &packet,
-                        read_ptr_host as u64,
+                        read_ptr_gpu_va,
                         completed_read_idx,
                         device_major,
-                        cpu_progress_updates,
+                        platform_atomic_support,
                     )?,
                     packet.completion_signal,
                 )
@@ -3472,13 +4094,42 @@ fn run_wsl_queue_worker(
                 unsafe { ptr::read_volatile(hw_queue_progress_fence_cpu_va) },
                 head.join(" ")
             );
+            if submit_cursor == 0 {
+                let dump: Vec<String> = pm4_cmds
+                    .iter()
+                    .take(64)
+                    .enumerate()
+                    .map(|(i, dw)| format!("{:02}:{:08X}", i, dw))
+                    .collect();
+                dxg_debug!(
+                    "[DXG] first_dispatch_pm4_dwords={} [{}]",
+                    pm4_cmds.len(),
+                    dump.join(" ")
+                );
+            }
         }
 
         if completed_read_idx > DXG_HW_QUEUE_FRAME_COUNT {
             let min_completed = completed_read_idx - DXG_HW_QUEUE_FRAME_COUNT + 1;
-            let completed = unsafe { ptr::read_volatile(hw_queue_progress_fence_cpu_va) };
-            if completed < min_completed {
-                device.wait_for_sync_object_value(hw_queue_progress_fence, min_completed)?;
+            let wait_start = std::time::Instant::now();
+            loop {
+                let completed = unsafe { ptr::read_volatile(read_ptr_host) };
+                if completed >= min_completed {
+                    break;
+                }
+                if use_hw_queue {
+                    device.wait_for_sync_object_value(hw_queue_progress_fence, min_completed)?;
+                }
+                if wait_start.elapsed() > std::time::Duration::from_secs(5) {
+                    return Err(format!(
+                        "Timed out waiting for reusable command frame: read_ptr={} target={} progress_fence={} {}",
+                        completed,
+                        min_completed,
+                        unsafe { ptr::read_volatile(hw_queue_progress_fence_cpu_va) },
+                        device.describe_device_state(),
+                    ));
+                }
+                std::hint::spin_loop();
             }
         }
 
@@ -3496,14 +4147,17 @@ fn run_wsl_queue_worker(
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         if use_hw_queue {
-            device.submit_command_to_hw_queue(
+            device.submit_command_to_hw_queue_on_context(
+                queue_context,
                 hw_queue,
                 cmd_buffer_gpu_va + frame_offset as u64,
                 pm4_len_bytes as u32,
                 completed_read_idx,
             )?;
         } else {
-            device.submit_command(
+            device.submit_command_on_context(
+                queue_context,
+                submit_queue_handle,
                 cmd_buffer_gpu_va + frame_offset as u64,
                 pm4_len_bytes as u32,
                 hw_queue_progress_fence,
@@ -3511,13 +4165,31 @@ fn run_wsl_queue_worker(
             )?;
         }
 
-        if cpu_progress_updates {
-            device.wait_for_sync_object_value(hw_queue_progress_fence, completed_read_idx)?;
-            unsafe {
-                if completion_signal != 0 {
-                    ptr::write_volatile((completion_signal + 8) as *mut i64, 0);
+        if completion_signal != 0 && !platform_atomic_support {
+            let wait_start = std::time::Instant::now();
+            loop {
+                let completed = unsafe { ptr::read_volatile(read_ptr_host) };
+                if completed >= completed_read_idx {
+                    break;
                 }
-                ptr::write_volatile(read_ptr_host, completed_read_idx);
+                if use_hw_queue {
+                    device.wait_for_sync_object_value(hw_queue_progress_fence, completed_read_idx)?;
+                }
+                if wait_start.elapsed() > std::time::Duration::from_secs(5) {
+                    return Err(format!(
+                        "Timed out waiting for completion signal retirement: read_ptr={} target={} progress_fence={} {}",
+                        completed,
+                        completed_read_idx,
+                        unsafe { ptr::read_volatile(hw_queue_progress_fence_cpu_va) },
+                        device.describe_device_state(),
+                    ));
+                }
+                std::hint::spin_loop();
+            }
+            unsafe {
+                let signal_ptr = (completion_signal + AMD_SIGNAL_VALUE_OFFSET as u64)
+                    as *const std::sync::atomic::AtomicI64;
+                (&*signal_ptr).fetch_sub(1, std::sync::atomic::Ordering::Release);
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         }
@@ -3546,13 +4218,17 @@ pub struct WslAqlQueue {
     doorbell_mmap_base: *mut c_void,
     doorbell_mmap_size: usize,
     use_hw_queue: bool,
+    queue_context: D3DKMT_HANDLE,
     hw_queue: D3DKMT_HANDLE,
     hw_queue_progress_fence: D3DKMT_HANDLE,
     hw_queue_progress_fence_cpu_va: *mut u64,
     worker_state: Arc<WslQueueWorkerState>,
     worker_thread: Option<std::thread::JoinHandle<()>>,
+    wait_idle_signal: WslGpuMemory,
+    _sw_queue_mem: Option<WslGpuMemory>,
     _amd_queue_mem: WslGpuMemory,
     _cmd_buffer: WslGpuMemory,
+    _scratch_mem: Option<WslGpuMemory>,
     device: Arc<WslDxgDevice>,
 }
 
@@ -3566,6 +4242,14 @@ impl WslAqlQueue {
 
     fn worker_error(&self) -> Option<String> {
         self.worker_state.error()
+    }
+
+    fn init_signal(&self, signal: &WslGpuMemory) {
+        verify_amd_signal_layout_once();
+        unsafe { ptr::write_bytes(signal.cpu_ptr, 0, AMD_SIGNAL_SIZE_BYTES) };
+        signal.write_val::<u64>(AMD_SIGNAL_KIND_OFFSET, AMD_SIGNAL_KIND_USER);
+        signal.write_val::<i64>(AMD_SIGNAL_VALUE_OFFSET, 1);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 
     fn ensure_ring_space(&self) -> Result<(), String> {
@@ -3589,6 +4273,7 @@ impl WslAqlQueue {
         grid: [u32; 3],
         kernarg_va: u64,
         signal_va: u64,
+        profile_timestamps: bool,
         acquire_scope: u16,
         release_scope: u16,
     ) -> Result<u64, String> {
@@ -3618,7 +4303,8 @@ impl WslAqlQueue {
             ptr::write_volatile(base.add(0x1C) as *mut u32, kernel.lds_size);
             ptr::write_volatile(base.add(0x20) as *mut u64, kernel.descriptor_va);
             ptr::write_volatile(base.add(0x28) as *mut u64, kernarg_va);
-            ptr::write_volatile(base.add(0x30) as *mut u64, 0u64);
+            let reserved2 = if profile_timestamps { AQL_RESERVED2_PROFILE_TS } else { 0 };
+            ptr::write_volatile(base.add(0x30) as *mut u64, reserved2);
             ptr::write_volatile(base.add(0x38) as *mut u64, signal_va);
 
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
@@ -3650,6 +4336,46 @@ impl WslAqlQueue {
         Ok(write_idx + 1)
     }
 
+    fn enqueue_barrier_packet(
+        &self,
+        signal_va: u64,
+        acquire_scope: u16,
+        release_scope: u16,
+    ) -> Result<u64, String> {
+        self.ensure_ring_space()?;
+        let write_idx = unsafe { ptr::read_volatile(self.write_ptr_host) };
+        let ring_mask = (self.ring_size as u64 / 64) - 1;
+        let slot_idx = write_idx & ring_mask;
+        let pkt_offset = (slot_idx * 64) as usize;
+
+        let header =
+            (HSA_PACKET_TYPE_BARRIER_AND as u16) |
+            (acquire_scope << 9) |
+            (release_scope << 11);
+
+        unsafe {
+            let base = self.ring_buffer.cpu_ptr.add(pkt_offset);
+            ptr::write_volatile(base.add(0x02) as *mut u16, 0u16);
+            ptr::write_volatile(base.add(0x04) as *mut u32, 0u32);
+            // dep_signal[0..5] = 0
+            for i in 0..5usize {
+                ptr::write_volatile(base.add(0x08 + i * 8) as *mut u64, 0u64);
+            }
+            ptr::write_volatile(base.add(0x30) as *mut u64, 0u64); // reserved2
+            ptr::write_volatile(base.add(0x38) as *mut u64, signal_va);
+
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            ptr::write_volatile(base as *mut u16, header);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+            let new_write_idx = write_idx + 1;
+            ptr::write_volatile(self.write_ptr_host, new_write_idx);
+        }
+
+        self.notify_worker();
+        Ok(write_idx + 1)
+    }
+
     /// Dispatch a kernel. Returns after GPU completes execution.
     pub fn dispatch(
         &self,
@@ -3668,38 +4394,100 @@ impl WslAqlQueue {
         kernargs: &WslGpuMemory,
         signal: Option<&WslGpuMemory>,
     ) -> Result<(), String> {
+        self.dispatch_signal_internal(kernel, grid, kernargs, signal, false)
+    }
+
+    fn dispatch_signal_internal(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &WslGpuMemory,
+        signal: Option<&WslGpuMemory>,
+        profile_timestamps: bool,
+    ) -> Result<(), String> {
         assert!(kernargs.size >= kernel.kernarg_size as usize,
             "kernarg too small: buffer={}B, kernel expects {}B",
             kernargs.size, kernel.kernarg_size);
 
         // Prepare completion signal (amd_signal_t layout)
         let signal_va = if let Some(sig) = signal {
-            unsafe { ptr::write_bytes(sig.cpu_ptr, 0, 64) };
-            sig.write_val::<u64>(0, 1); // kind = AMD_SIGNAL_KIND_USER
-            sig.write_val::<i64>(8, 1); // value = 1
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            self.init_signal(sig);
             sig.gpu_va
         } else {
             0
         };
+
+        if dxg_debug_enabled() {
+            let mut words = [0u64; 8];
+            if !kernargs.cpu_ptr.is_null() && kernargs.size >= 64 {
+                unsafe {
+                    for (i, w) in words.iter_mut().enumerate() {
+                        *w = ptr::read_volatile(kernargs.cpu_ptr.add(i * 8) as *const u64);
+                    }
+                }
+                dxg_debug!(
+                    "[DXG] kernargs head: [{:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X} {:016X}]",
+                    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]
+                );
+            } else {
+                dxg_debug!(
+                    "[DXG] kernargs head unavailable: cpu_ptr={:?} size={}",
+                    kernargs.cpu_ptr,
+                    kernargs.size
+                );
+            }
+        }
 
         let target = self.enqueue_dispatch_packet(
             kernel,
             grid,
             kernargs.gpu_va,
             signal_va,
+            profile_timestamps,
             HSA_FENCE_SCOPE_SYSTEM,
             HSA_FENCE_SCOPE_SYSTEM,
         )?;
 
         // Wait for completion
         if let Some(sig) = signal {
-            self.wait_signal(sig)?;
+            self.wait_signal(sig, target)?;
         } else {
             self.wait_read_ptr(target)?;
         }
 
         Ok(())
+    }
+
+    pub fn dispatch_signal_profiled(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &WslGpuMemory,
+        signal: &WslGpuMemory,
+    ) -> Result<(u64, u64), String> {
+        self.dispatch_signal_internal(kernel, grid, kernargs, Some(signal), true)?;
+        let timeout_ns: u64 = 10_000_000_000;
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(err) = self.worker_error() {
+                return Err(err);
+            }
+            let start_ts: u64 = signal.read_val(AMD_SIGNAL_START_TS_OFFSET);
+            let end_ts: u64 = signal.read_val(AMD_SIGNAL_END_TS_OFFSET);
+            if start_ts != 0 && end_ts > start_ts {
+                return Ok((start_ts, end_ts));
+            }
+            if start.elapsed().as_nanos() as u64 > timeout_ns {
+                let signal_value: i64 = signal.read_val(AMD_SIGNAL_VALUE_OFFSET);
+                return Err(format!(
+                    "DXG profiling timestamp wait timeout: signal={} start_ts={} end_ts={}",
+                    signal_value,
+                    start_ts,
+                    end_ts,
+                ));
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Submit without waiting — pipelined dispatch.
@@ -3714,6 +4502,7 @@ impl WslAqlQueue {
             grid,
             kernargs.gpu_va,
             0,
+            false,
             HSA_FENCE_SCOPE_SYSTEM,
             HSA_FENCE_SCOPE_SYSTEM,
         ).expect("failed to enqueue DXG dispatch packet");
@@ -3721,8 +4510,18 @@ impl WslAqlQueue {
 
     /// Wait for all pending dispatches.
     pub fn wait_idle(&self) -> Result<(), String> {
-        let target = unsafe { ptr::read_volatile(self.write_ptr_host) };
-        self.wait_read_ptr(target)
+        if let Some(err) = self.worker_error() {
+            return Err(err);
+        }
+        // Precise queue drain: enqueue a barrier packet and wait its completion signal.
+        // This avoids relying on read_ptr pseudo-completion under DXG.
+        self.init_signal(&self.wait_idle_signal);
+        let target = self.enqueue_barrier_packet(
+            self.wait_idle_signal.gpu_va,
+            HSA_FENCE_SCOPE_SYSTEM,
+            HSA_FENCE_SCOPE_SYSTEM,
+        )?;
+        self.wait_signal(&self.wait_idle_signal, target)
     }
 
     /// Wait for all pending dispatches + memory fence.
@@ -3747,6 +4546,7 @@ impl WslAqlQueue {
             grid,
             kernargs.gpu_va,
             0,
+            false,
             HSA_FENCE_SCOPE_AGENT,
             HSA_FENCE_SCOPE_AGENT,
         ).expect("failed to enqueue DXG fast dispatch packet");
@@ -3800,7 +4600,7 @@ impl WslAqlQueue {
         }
     }
 
-    fn wait_signal(&self, signal: &WslGpuMemory) -> Result<(), String> {
+    fn wait_signal(&self, signal: &WslGpuMemory, target: u64) -> Result<(), String> {
         let timeout_ns: u64 = 10_000_000_000;
         let start = std::time::Instant::now();
         loop {
@@ -3808,11 +4608,20 @@ impl WslAqlQueue {
                 return Err(err);
             }
             let val: i64 = signal.read_val(8);
-            if val == 0 {
+            let read_idx = unsafe { ptr::read_volatile(self.read_ptr_host) };
+            if val == 0 && read_idx >= target {
                 return Ok(());
             }
             if start.elapsed().as_nanos() as u64 > timeout_ns {
-                return Err("Signal wait timeout".to_string());
+                let device_state = self.device.describe_device_state();
+                return Err(format!(
+                    "Signal wait timeout: signal={} read_idx={} target={} progress_fence={} {}",
+                    val,
+                    read_idx,
+                    target,
+                    unsafe { ptr::read_volatile(self.hw_queue_progress_fence_cpu_va) },
+                    device_state
+                ));
             }
             std::hint::spin_loop();
         }
@@ -3845,6 +4654,7 @@ impl Drop for WslAqlQueue {
         } else {
             self.device.destroy_sync_object(self.hw_queue_progress_fence);
         }
+        self.device.destroy_context(self.queue_context);
     }
 }
 
@@ -4096,7 +4906,8 @@ impl GpuKernel {
         // Read back to flush WC buffers
         let _ = unsafe { std::ptr::read_volatile(code_buf.cpu_ptr) };
 
-        // Patch kernel descriptor: set PRIV bit (bit 20 of compute_pgm_rsrc1 at KD offset 0x30)
+        // Patch kernel descriptor: set RSRC1.PRIV (bit 20) only on gfx11.
+        // Align with librocdxg CmdUtil::BuildDispatch behavior.
         let (rsrc1, rsrc2, rsrc3, entry_offset, kd_kernarg_size, kernel_code_properties, private_segment_size, kd_group_segment_size);
         unsafe {
             let kd_ptr = code_buf.cpu_ptr.add(kd_offset);
@@ -4115,7 +4926,11 @@ impl GpuKernel {
 
             let rsrc1_ptr = kd_ptr.add(KD_COMPUTE_PGM_RSRC1_OFFSET) as *mut u32;
             let raw_rsrc1 = ptr::read_volatile(rsrc1_ptr);
-            let patched_rsrc1 = raw_rsrc1 | (1 << 20); // PRIV bit
+            let patched_rsrc1 = if device.device_info.major() == 11 {
+                raw_rsrc1 | (1 << 20) // PRIV bit required on current DXG compute path
+            } else {
+                raw_rsrc1
+            };
 
             let wgp_on = (patched_rsrc1 >> 29) & 1 == 1;
             dxg_debug!("[DXG] RSRC1=0x{:08X} WGP_MODE(bit29)={}", patched_rsrc1, wgp_on);
@@ -4236,8 +5051,8 @@ impl DispatchPool {
         grid: [u32; 3],
         ka_idx: usize,
     ) -> Result<(), String> {
-        self.signal.write_val::<u64>(0, 1);
-        self.signal.write_val::<i64>(8, 1);
+        self.signal.write_val::<u64>(AMD_SIGNAL_KIND_OFFSET, AMD_SIGNAL_KIND_USER);
+        self.signal.write_val::<i64>(AMD_SIGNAL_VALUE_OFFSET, 1);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         let ka = self.get_kernargs(ka_idx);
         queue.dispatch_signal(kernel, grid, ka, Some(&self.signal))

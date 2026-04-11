@@ -17,6 +17,7 @@ const PROXY_ADAPTER_INFO_QUERY_SIZE: usize = 0xbc0;
 
 const ENGINE_ORDINAL_TABLE_OFFSET: usize = 0x89c;
 const ENGINE_ORDINAL_TABLE_LEN: usize = 32;
+const GPU_COUNTER_FREQUENCY_OFFSET: usize = 0xa24;
 const LOCAL_VISIBLE_HEAP_SIZE_OFFSET: usize = 0xa30;
 const LOCAL_INVISIBLE_HEAP_SIZE_OFFSET: usize = 0xa38;
 const NON_LOCAL_HEAP_SIZE_OFFSET: usize = 0xa40;
@@ -25,14 +26,14 @@ const HWS_ORDINAL_MASK_SOURCE_OFFSET: usize = 0x35c4;
 const DISABLE_GPU_TIMEOUT_MASK_OFFSET: usize = 0x35d8;
 const ADAPTER_DEVICE_ID_OFFSET: usize = 0x3a2c;
 const DGPU_FLAG_OFFSET: usize = 0x3c8c;
-const DGPU_STATE_SHADOWING_OFFSET: usize = 0xc46;
-const IGPU_STATE_SHADOWING_OFFSET: usize = 0x208;
+const STATE_SHADOWING_BY_CP_FW_OFFSET: usize = 0xc46;
+const PLATFORM_ATOMIC_SUPPORT_OFFSET: usize = 0x208;
 
 const CONTEXT_PRIV_DATA_SIZE: usize = 0x40;
 const ALLOC_PRIV_DRV_DATA_SIZE: usize = 0x40;
 const ALLOC_PRIV_DATA_SIZE: usize = 0x218;
+const POWER_OPT_PRIV_DATA_SIZE: usize = 0xe8;
 
-const DEFAULT_GFX_MAJOR: u32 = 12;
 const COMPUTE_ENGINE: u32 = 5;
 const SUPPORTED_HWS_ENGINES: [u32; 4] = [0, 5, 4, 7];
 
@@ -49,11 +50,13 @@ pub(crate) struct DxgThunkDeviceInfo {
     raw: Vec<u8>,
     major: u32,
     is_dgpu: bool,
+    gpu_counter_frequency: u64,
     local_visible_heap_size: u64,
     local_invisible_heap_size: u64,
     non_local_heap_size: u64,
     compute_schedid: u32,
     state_shadowing_by_cpfw: bool,
+    platform_atomic_support: bool,
     hws_engine_ordinal_mask: u64,
     disable_gpu_timeout_ordinal_mask: u64,
 }
@@ -77,6 +80,8 @@ impl DxgThunkDeviceInfo {
 
         let device_id = read_u32(&raw, ADAPTER_DEVICE_ID_OFFSET);
         let is_dgpu = read_u32(&raw, DGPU_FLAG_OFFSET) == 0;
+        // Matches librocdxg's DeviceInfo::gpu_counter_frequency field.
+        let gpu_counter_frequency = read_u64(&raw, GPU_COUNTER_FREQUENCY_OFFSET);
         let mut local_visible_heap_size = read_u64(&raw, LOCAL_VISIBLE_HEAP_SIZE_OFFSET);
         let local_invisible_heap_size = read_u64(&raw, LOCAL_INVISIBLE_HEAP_SIZE_OFFSET);
         let mut non_local_heap_size = read_u64(&raw, NON_LOCAL_HEAP_SIZE_OFFSET);
@@ -96,12 +101,17 @@ impl DxgThunkDeviceInfo {
             .map(|_| COMPUTE_ENGINE)
             .ok_or_else(|| format!("No compute queue engine {} found in adapter info", COMPUTE_ENGINE))?;
 
-        let state_shadowing_offset = if is_dgpu {
-            DGPU_STATE_SHADOWING_OFFSET
+        let state_shadowing_by_cpfw =
+            (read_u8(&raw, STATE_SHADOWING_BY_CP_FW_OFFSET) & 0x20) != 0;
+        // Match libthunk_proxy::ParseAdapterInfo:
+        // - state_shadowing_by_cpfw always comes from raw[0x0c46] bit 5
+        // - platform_atomic_support comes from raw[0x0208] bit 5 on dGPU
+        //   and is forced on for iGPU
+        let platform_atomic_support = if is_dgpu {
+            (read_u8(&raw, PLATFORM_ATOMIC_SUPPORT_OFFSET) & 0x20) != 0
         } else {
-            IGPU_STATE_SHADOWING_OFFSET
+            true
         };
-        let state_shadowing_by_cpfw = (read_u8(&raw, state_shadowing_offset) & 0x20) != 0;
 
         let mut hws_engine_ordinal_mask = 0u64;
         if (read_u8(&raw, HWS_MASK_GATE_OFFSET) & 0x01) != 0 {
@@ -120,13 +130,15 @@ impl DxgThunkDeviceInfo {
 
         Ok(Self {
             raw,
-            major: infer_gfx_major(device_id),
+            major: infer_gfx_major(device_id)?,
             is_dgpu,
+            gpu_counter_frequency,
             local_visible_heap_size,
             local_invisible_heap_size,
             non_local_heap_size,
             compute_schedid,
             state_shadowing_by_cpfw,
+            platform_atomic_support,
             hws_engine_ordinal_mask,
             disable_gpu_timeout_ordinal_mask,
         })
@@ -144,8 +156,16 @@ impl DxgThunkDeviceInfo {
         self.is_dgpu
     }
 
+    pub(crate) fn gpu_counter_frequency(&self) -> u64 {
+        self.gpu_counter_frequency
+    }
+
     pub(crate) fn state_shadowing_by_cpfw(&self) -> bool {
         self.state_shadowing_by_cpfw
+    }
+
+    pub(crate) fn platform_atomic_support(&self) -> bool {
+        self.platform_atomic_support
     }
 
     pub(crate) fn engine_ordinal(&self, engine: u32) -> Result<u32, String> {
@@ -153,18 +173,14 @@ impl DxgThunkDeviceInfo {
             .ok_or_else(|| format!("EngineOrdinal failed for engine {}", engine))
     }
 
-    pub(crate) fn hws_enabled(&self, engine: u32) -> bool {
-        self.engine_ordinal(engine)
-            .ok()
-            .map(|ordinal| self.hws_engine_ordinal_mask & ordinal_bit(ordinal) != 0)
-            .unwrap_or(false)
+    pub(crate) fn hws_enabled(&self, engine: u32) -> Result<bool, String> {
+        let ordinal = self.engine_ordinal(engine)?;
+        Ok(self.hws_engine_ordinal_mask & ordinal_bit(ordinal) != 0)
     }
 
-    pub(crate) fn should_disable_gpu_timeout(&self, engine: u32) -> bool {
-        self.engine_ordinal(engine)
-            .ok()
-            .map(|ordinal| self.disable_gpu_timeout_ordinal_mask & ordinal_bit(ordinal) != 0)
-            .unwrap_or(false)
+    pub(crate) fn should_disable_gpu_timeout(&self, engine: u32) -> Result<bool, String> {
+        let ordinal = self.engine_ordinal(engine)?;
+        Ok(self.disable_gpu_timeout_ordinal_mask & ordinal_bit(ordinal) != 0)
     }
 
     pub(crate) fn queue_engine_flag(&self, queue_engine: u32) -> Result<u32, String> {
@@ -307,6 +323,21 @@ pub(crate) fn build_hw_queue_priv_data(
     priv_data
 }
 
+pub(crate) fn build_power_opt_priv_data(restore: bool) -> Vec<u8> {
+    // Matches thunk_proxy::FillinPowerOptPrivData from librocdxg's reference
+    // archive. This is a device-private DXG escape, not an HSA/runtime layer.
+    let mut priv_data = vec![0u8; POWER_OPT_PRIV_DATA_SIZE];
+    priv_data[..16].copy_from_slice(&[
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x03, 0x69, 0x00, 0x03, 0x03, 0x00, 0x00, 0x00,
+    ]);
+    priv_data[0x84] = u8::from(restore);
+    priv_data[0x88] |= 0x02;
+    write_u32(&mut priv_data, 0x80, 0x40);
+    write_u32(&mut priv_data, 0xc4, 0x20);
+    priv_data
+}
+
 fn query_umd_private(adapter: D3DKMT_HANDLE, size: usize, name: &str) -> Result<Vec<u8>, String> {
     let mut buffer = vec![0u8; size];
     let query = D3DKMT_QUERYADAPTERINFO {
@@ -363,8 +394,19 @@ fn engine_flag_to_queue_engine_id(engine_flag: u32) -> Option<u8> {
     }
 }
 
-fn infer_gfx_major(_device_id: u32) -> u32 {
-    DEFAULT_GFX_MAJOR
+fn infer_gfx_major(device_id: u32) -> Result<u32, String> {
+    match device_id {
+        // RX 7900 XTX class (RDNA3 / GFX11) observed via DXG query path.
+        0x13C0 => Ok(11),
+        // RX 9070 XT class (RDNA4 / GFX12) observed via DXG query path.
+        0x7550 => Ok(12),
+        // RX 9070 class (RDNA4 / GFX12) observed via DXG query path.
+        0x7551 => Ok(12),
+        _ => Err(format!(
+            "Unsupported AMD device id 0x{:04X}: cannot infer gfx major without fallback",
+            device_id
+        )),
+    }
 }
 
 fn find_engine_ordinal(raw: &[u8], engine: u32) -> Option<u32> {

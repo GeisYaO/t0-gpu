@@ -44,8 +44,8 @@ pub struct GemmTuneResult {
 ///
 /// Caches results both in-memory and on disk (`~/.t0_autotune/`).
 pub struct GemmTuner {
-    /// In-memory cache: (M, N, K) → result
-    cache: HashMap<(u32, u32, u32), GemmTuneResult>,
+    /// In-memory cache: (target, M, N, K) → result
+    cache: HashMap<(super::ir::Target, u32, u32, u32), GemmTuneResult>,
     /// Disk cache directory
     cache_dir: PathBuf,
     /// Maximum candidates to benchmark (cost_model pre-filters the rest)
@@ -84,7 +84,8 @@ impl GemmTuner {
         rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
         m: u32, n: u32, k: u32,
     ) -> Result<GemmConfig, String> {
-        let key = (m, n, k);
+        let target = rt.device.target();
+        let key = (target, m, n, k);
 
         // 1. In-memory cache
         if let Some(cached) = self.cache.get(&key) {
@@ -92,7 +93,7 @@ impl GemmTuner {
         }
 
         // 2. Disk cache
-        if let Some(cached) = self.load_cache(m, n, k) {
+        if let Some(cached) = self.load_cache(target, m, n, k) {
             eprintln!("[autotune] Cache hit: {}×{}×{} → {} ({:.1} TF)",
                 m, n, k, cached.best.name(), cached.best_tflops);
             let cfg = cached.best.clone();
@@ -101,7 +102,7 @@ impl GemmTuner {
         }
 
         // 3. Generate candidates via cost_model
-        let cost_results = cost_model::auto_schedule_gemm(m, n, k, DataFormat::BF16);
+        let cost_results = cost_model::auto_schedule_gemm_for_target(target, m, n, k, DataFormat::BF16);
         let candidates: Vec<GemmConfig> = cost_results.iter()
             .take(self.max_candidates)
             .map(|c| c.config.to_gemm_config())
@@ -150,12 +151,12 @@ impl GemmTuner {
             best: best.0.clone(),
             best_tflops: best.1,
             all: results.iter().map(|(c, t)| (c.name(), *t)).collect(),
-            key,
+            key: (m, n, k),
             from_cache: false,
         };
 
         // 6. Persist
-        self.save_cache(m, n, k, &tune_result);
+        self.save_cache(target, m, n, k, &tune_result);
         self.cache.insert(key, tune_result);
 
         Ok(best.0)
@@ -173,10 +174,11 @@ impl GemmTuner {
         m: u32, n: u32, k: u32,
     ) -> Result<f64, String> {
         use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
+        let target = rt.device.target();
 
         // 1. Generate and compile kernel
-        let kernel_ir = super::gemm_gen::generate(cfg);
-        let elf = kernel_ir.compile(super::ir::Target::GFX1100)?;
+        let kernel_ir = super::ir::with_target_context(target, || super::gemm_gen::generate(cfg));
+        let elf = kernel_ir.compile(target)?;
         let lds_size = kernel_ir.lds_size();
 
         let gpu_kernel = GpuKernel::load(
@@ -246,6 +248,7 @@ impl GemmTuner {
         m: u32, n: u32, k: u32,
     ) -> Result<f64, String> {
         use crate::gpu_backend::{GpuKernel, KernelLoadConfig};
+        let target = rt.device.target();
 
         // Safety: reject configs with LDS > 64KB (CWSR hang on GFX1100)
         let lds_total = spec.lds_total();
@@ -257,8 +260,8 @@ impl GemmTuner {
         // Use catch_unwind because tile_ir has asserts (e.g., tile_k power-of-2)
         let spec_clone = spec.clone();
         let compile_result = std::panic::catch_unwind(move || {
-            let kernel_ir = super::tile_ir::lower_gemm(&spec_clone);
-            let elf = kernel_ir.compile(super::ir::Target::GFX1100);
+            let kernel_ir = super::ir::with_target_context(target, || super::tile_ir::lower_gemm(&spec_clone));
+            let elf = kernel_ir.compile(target);
             let lds_size = kernel_ir.lds_size();
             (elf, lds_size)
         });
@@ -322,12 +325,12 @@ impl GemmTuner {
 
     // ── Cache persistence ──
 
-    fn cache_path(&self, m: u32, n: u32, k: u32) -> PathBuf {
-        self.cache_dir.join(format!("gemm_{}x{}x{}.json", m, n, k))
+    fn cache_path(&self, target: super::ir::Target, m: u32, n: u32, k: u32) -> PathBuf {
+        self.cache_dir.join(format!("gemm_{}_{}x{}x{}.json", target.mcpu_str(), m, n, k))
     }
 
-    fn load_cache(&self, m: u32, n: u32, k: u32) -> Option<GemmTuneResult> {
-        let path = self.cache_path(m, n, k);
+    fn load_cache(&self, target: super::ir::Target, m: u32, n: u32, k: u32) -> Option<GemmTuneResult> {
+        let path = self.cache_path(target, m, n, k);
         let content = std::fs::read_to_string(&path).ok()?;
 
         // Parse minimal JSON: {"best":"name","tflops":79.2,"tile_m":128,...}
@@ -361,9 +364,9 @@ impl GemmTuner {
         })
     }
 
-    fn save_cache(&self, m: u32, n: u32, k: u32, result: &GemmTuneResult) {
+    fn save_cache(&self, target: super::ir::Target, m: u32, n: u32, k: u32, result: &GemmTuneResult) {
         let _ = std::fs::create_dir_all(&self.cache_dir);
-        let path = self.cache_path(m, n, k);
+        let path = self.cache_path(target, m, n, k);
         let cfg = &result.best;
         let sk = cfg.split_k.unwrap_or(1);
 
@@ -391,9 +394,9 @@ impl GemmTuner {
     }
 
     /// Invalidate cache for a specific problem size.
-    pub fn invalidate(&mut self, m: u32, n: u32, k: u32) {
-        self.cache.remove(&(m, n, k));
-        let _ = std::fs::remove_file(self.cache_path(m, n, k));
+    pub fn invalidate(&mut self, target: super::ir::Target, m: u32, n: u32, k: u32) {
+        self.cache.remove(&(target, m, n, k));
+        let _ = std::fs::remove_file(self.cache_path(target, m, n, k));
     }
 
     /// Clear all cached results.
@@ -407,9 +410,9 @@ impl GemmTuner {
         eprintln!("╔═══════════════════════════════════════════════════╗");
         eprintln!("║  GEMM Autotune Cache ({} entries)               ║", self.cache.len());
         eprintln!("╠═══════════════════════════════════════════════════╣");
-        for ((m, n, k), result) in &self.cache {
-            eprintln!("║  {}×{}×{} → {} ({:.1} TF) {}",
-                m, n, k, result.best.name(), result.best_tflops,
+        for ((target, m, n, k), result) in &self.cache {
+            eprintln!("║  {:?} {}×{}×{} → {} ({:.1} TF) {}",
+                target, m, n, k, result.best.name(), result.best_tflops,
                 if result.from_cache { "[cached]" } else { "[measured]" });
         }
         eprintln!("╚═══════════════════════════════════════════════════╝");
@@ -449,6 +452,8 @@ pub fn auto_gemm(
     c_buf: &crate::gpu_backend::GpuBuffer,
     m: u32, n: u32, k: u32,
 ) -> Result<f64, String> {
+    let target = rt.device.target();
+
     // 1. Tune (or cache hit)
     let cfg = {
         let mut tuner = global_tuner().lock().map_err(|e| e.to_string())?;
@@ -460,7 +465,7 @@ pub fn auto_gemm(
         &cfg.name(),
         || super::gemm_gen::generate(&cfg),
         [cfg.wg_size, 1, 1],
-        super::gemm_gen::generate(&cfg).lds_size(),
+        super::ir::with_target_context(target, || super::gemm_gen::generate(&cfg).lds_size()),
     )?;
 
     // 3. Build kernargs + dispatch
@@ -473,7 +478,7 @@ pub fn auto_gemm(
 
     // 4. Return achieved TFLOPS (from cache)
     let tuner = global_tuner().lock().map_err(|e| e.to_string())?;
-    let tflops = tuner.cache.get(&(m, n, k))
+    let tflops = tuner.cache.get(&(target, m, n, k))
         .map(|r| r.best_tflops)
         .unwrap_or(0.0);
     Ok(tflops)
@@ -557,7 +562,7 @@ mod tests {
             .expect("tune failed");
 
         eprintln!("Best config: {}", cfg.name());
-        let result = tuner.cache.get(&(4096, 4096, 4096)).unwrap();
+        let result = tuner.cache.get(&(rt.device.target(), 4096, 4096, 4096)).unwrap();
         eprintln!("TFLOPS: {:.1}", result.best_tflops);
 
         assert!(result.best_tflops > 50.0,
@@ -595,10 +600,10 @@ mod tests {
             from_cache: false,
         };
 
-        tuner.save_cache(4096, 4096, 4096, &result);
+        tuner.save_cache(super::super::ir::Target::GFX1201, 4096, 4096, 4096, &result);
 
         // Load back
-        let loaded = tuner.load_cache(4096, 4096, 4096)
+        let loaded = tuner.load_cache(super::super::ir::Target::GFX1201, 4096, 4096, 4096)
             .expect("cache load failed");
         assert_eq!(loaded.best.tile_m, 128);
         assert_eq!(loaded.best.tile_n, 64);

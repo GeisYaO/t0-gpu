@@ -103,6 +103,8 @@ pub struct GpuRuntime {
     /// Queue poisoned flag: set after GPU timeout/reset to prevent further dispatches
     /// that would cause cascading hangs on the already-corrupted queue.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Serializes reuse of the shared completion signal in `DispatchPool`.
+    precise_dispatch_lock: Mutex<()>,
 }
 
 #[cfg(any(feature = "rocm", feature = "wsl_dxg"))]
@@ -125,6 +127,7 @@ impl GpuRuntime {
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            precise_dispatch_lock: Mutex::new(()),
         }))
     }
 
@@ -143,6 +146,7 @@ impl GpuRuntime {
             bf16_cache: Mutex::new(HashMap::new()),
             args_cache: Mutex::new(HashMap::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            precise_dispatch_lock: Mutex::new(()),
         }))
     }
 
@@ -263,6 +267,17 @@ impl GpuRuntime {
         slot
     }
 
+    #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+    fn dump_asm_only_mode(&self) -> bool {
+        std::env::var("T0_DUMP_ASM").is_ok()
+            && matches!(self.device.target(), crate::t0::ir::Target::GFX1201)
+    }
+
+    #[cfg(not(all(feature = "wsl_dxg", not(feature = "rocm"))))]
+    fn dump_asm_only_mode(&self) -> bool {
+        false
+    }
+
     /// Dispatch a kernel with the given grid size and kernarg data.
     ///
     /// This is a synchronous dispatch: writes kernargs, submits, waits.
@@ -273,6 +288,11 @@ impl GpuRuntime {
         grid: [u32; 3],
         kernargs: &[u8],
     ) -> Result<(), String> {
+        if self.dump_asm_only_mode() {
+            return Err(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: compile/ASM dump is enabled and GPU dispatch is intentionally blocked".into()
+            );
+        }
         if self.is_poisoned() {
             return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
         }
@@ -284,13 +304,174 @@ impl GpuRuntime {
             Self::validate_kernarg_pointers(kernargs);
         }
 
+        #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+        {
+            return self.dispatch_precise(kernel, grid, kernargs);
+        }
+
+        #[cfg(not(all(feature = "wsl_dxg", not(feature = "rocm"))))]
+        {
+            let slot = self.next_slot();
+            let ka_buf = self.pool.write_kernargs(slot, kernargs);
+            self.queue.submit(kernel, grid, ka_buf);
+            self.queue.wait_idle().map_err(|e| {
+                self.mark_poisoned();
+                e
+            })
+        }
+    }
+
+    /// Dispatch a kernel and wait for real completion via the reusable signal.
+    ///
+    /// Unlike `wait_idle()`, this is safe for backends whose queue read pointer
+    /// can advance before the kernel has actually retired.
+    pub fn dispatch_precise(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &[u8],
+    ) -> Result<(), String> {
+        self.dispatch_batch_precise(kernel, grid, kernargs, 1)
+    }
+
+    /// Submit a batch of identical dispatches and wait for the final one with a
+    /// completion signal. This preserves FIFO throughput benchmarking while
+    /// still measuring true GPU completion.
+    pub fn dispatch_batch_precise(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &[u8],
+        n_iters: usize,
+    ) -> Result<(), String> {
+        if self.dump_asm_only_mode() {
+            return Err(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: compile/ASM dump is enabled and GPU dispatch is intentionally blocked".into()
+            );
+        }
+        if self.is_poisoned() {
+            return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
+        }
+        if n_iters == 0 {
+            return Ok(());
+        }
+
+        if std::env::var("T0_VALIDATE_KA").is_ok() {
+            Self::validate_kernarg_pointers(kernargs);
+        }
+
+        let _signal_guard = self.precise_dispatch_lock.lock().unwrap();
+
+        for _ in 0..(n_iters - 1) {
+            let slot = self.next_slot();
+            let ka_buf = self.pool.write_kernargs(slot, kernargs);
+            self.queue.submit(kernel, grid, ka_buf);
+        }
+
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
-        self.queue.submit(kernel, grid, ka_buf);
-        self.queue.wait_idle().map_err(|e| {
-            self.mark_poisoned();
-            e
-        })
+        self.queue
+            .dispatch_signal(kernel, grid, ka_buf, Some(&self.pool.signal))
+            .map_err(|e| {
+                self.mark_poisoned();
+                e
+            })
+    }
+
+    #[cfg(all(feature = "wsl_dxg", not(feature = "rocm")))]
+    pub fn dispatch_batch_profiled_gpu_us(
+        &self,
+        kernel: &GpuKernel,
+        grid: [u32; 3],
+        kernargs: &[u8],
+        n_iters: usize,
+    ) -> Result<f64, String> {
+        if self.dump_asm_only_mode() {
+            return Err(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: compile/ASM dump is enabled and GPU dispatch is intentionally blocked".into()
+            );
+        }
+        if self.is_poisoned() {
+            return Err("[KFD] Queue poisoned after GPU hang — refusing dispatch to prevent system hang".into());
+        }
+        if n_iters == 0 {
+            return Ok(0.0);
+        }
+
+        if std::env::var("T0_VALIDATE_KA").is_ok() {
+            Self::validate_kernarg_pointers(kernargs);
+        }
+
+        let _signal_guard = self.precise_dispatch_lock.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut gpu_tick_deltas: Vec<u64> = Vec::with_capacity(n_iters);
+
+        for _ in 0..n_iters {
+            let slot = self.next_slot();
+            let ka_buf = self.pool.write_kernargs(slot, kernargs);
+            let (start_ts, end_ts) = self.queue
+                .dispatch_signal_profiled(kernel, grid, ka_buf, &self.pool.signal)
+                .map_err(|e| {
+                    self.mark_poisoned();
+                    e
+                })?;
+            if end_ts < start_ts {
+                return Err(format!(
+                    "DXG GPU timestamp chain invalid: end_ts({}) < start_ts({})",
+                    end_ts, start_ts
+                ));
+            }
+            gpu_tick_deltas.push(end_ts - start_ts);
+        }
+
+        // Keep wall-clock for diagnostics only.
+        let wall_avg_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        if gpu_tick_deltas.is_empty() {
+            return Err("DXG GPU timestamp chain empty: no profiling ticks captured".to_string());
+        }
+        let mut sorted = gpu_tick_deltas.clone();
+        sorted.sort_unstable();
+        let min_tick = sorted[0];
+        let med_tick = sorted[sorted.len() / 2];
+        let max_tick = *sorted.last().unwrap();
+        let sum_ticks: u128 = gpu_tick_deltas.iter().map(|&v| v as u128).sum();
+        let avg_tick = sum_ticks as f64 / gpu_tick_deltas.len() as f64;
+
+        // Align with librocdxg conversion path:
+        // elapsed ticks are converted by adapter-reported gpu_counter_frequency.
+        let freq_hz = self.device.gpu_counter_frequency_hz()?;
+
+        let gpu_avg_us = avg_tick * 1_000_000.0 / freq_hz as f64;
+        let ratio = if wall_avg_us > 0.0 { gpu_avg_us / wall_avg_us } else { 0.0 };
+        let unreliable = ratio < 0.5 || ratio > 2.0;
+        let calib_info = match self.device.query_clock_calibration() {
+            Ok(calib) => format!(
+                "calib[gpu_freq={},gpu_counter={},cpu_counter={}]",
+                calib.gpu_frequency_hz, calib.gpu_clock_counter, calib.cpu_clock_counter
+            ),
+            Err(err) => format!("calib[error={}]", err),
+        };
+        if matches!(
+            std::env::var("T0_DXG_DEBUG").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        ) {
+            eprintln!(
+                "[DXG PROFILE] n={} wall_avg_us={:.3} gpu_avg_us={:.3} ratio={:.3} unreliable={} freq_hz={} tick[min/med/max]={}/{}/{} {}",
+                n_iters,
+                wall_avg_us,
+                gpu_avg_us,
+                ratio,
+                unreliable,
+                freq_hz,
+                min_tick,
+                med_tick,
+                max_tick,
+                calib_info,
+            );
+        }
+
+        Ok(gpu_avg_us)
     }
 
     /// Benchmark-optimized dispatch: AGENT fence scope + spin-wait.
@@ -306,6 +487,12 @@ impl GpuRuntime {
         grid: [u32; 3],
         kernargs: &[u8],
     ) {
+        if self.dump_asm_only_mode() {
+            eprintln!(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: skip dispatch_bench (ASM dump only mode)"
+            );
+            return;
+        }
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
         self.queue.submit_fast(kernel, grid, ka_buf);
@@ -341,6 +528,12 @@ impl GpuRuntime {
         grid: [u32; 3],
         kernargs: &[u8],
     ) -> usize {
+        if self.dump_asm_only_mode() {
+            eprintln!(
+                "[DXG] T0_DUMP_ASM=1 on GFX1201: skip dispatch_async (ASM dump only mode)"
+            );
+            return usize::MAX;
+        }
         let slot = self.next_slot();
         let ka_buf = self.pool.write_kernargs(slot, kernargs);
         self.queue.submit(kernel, grid, ka_buf);

@@ -27,7 +27,7 @@ use super::block_dsl::{BlockKernel, BNode, BVal, BType};
 use super::tile_ssa::{TileFunc, Value, ScalarDType, BinOpKind, UnaryOpKind, CmpOpKind, ForLoop};
 use super::tile_ssa_lower;
 use super::dsl::{CompiledKernel, KernArgMeta, KernArgType};
-use super::ir::{Target, ArgKind};
+use super::ir::{with_target_context, Target, ArgKind};
 
 use std::collections::HashMap;
 
@@ -451,7 +451,7 @@ impl BlockKernel {
         // Step 2: Check if this is a GEMM kernel (contains TileLoad2D/TileDot)
         if tile_ssa_lower::analyze_tiled_gemm(&func).is_ok() {
             // GEMM path: lower via tile_ir
-            let lowered = tile_ssa_lower::lower_tiled_gemm(&func)?;
+            let lowered = tile_ssa_lower::lower_tiled_gemm_for_target(target, &func)?;
             // CRITICAL: use compile_with_info to get final LDS size including
             // SSA regalloc spill regions. Without this, KFD under-allocates LDS → GPU hang.
             let (elf, final_lds) = lowered.kernel.compile_with_info(target)?;
@@ -482,7 +482,9 @@ impl BlockKernel {
             // validated for all kernel types including wg_reduce and GEMM.
             let wg_size = self.get_block_size();
             let epl = 1u32;
-            let lowered = tile_ssa_lower::lower_elementwise_1d(&func, wg_size, epl)?;
+            let lowered = with_target_context(target, || {
+                tile_ssa_lower::lower_elementwise_1d(&func, wg_size, epl)
+            })?;
             let elf = lowered.kernel.compile(target)?;
 
             let args: Vec<KernArgMeta> = lowered.kernel.args().iter().map(|a| {

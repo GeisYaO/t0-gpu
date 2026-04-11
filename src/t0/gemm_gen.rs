@@ -184,24 +184,35 @@ impl GemmConfig {
     pub fn wmma_per_k_tile(&self) -> usize {
         self.n_row_blocks() * self.n_col_tiles() * self.k_sub_steps() as usize
     }
-    /// Estimated VGPR usage for LDS double-buffer kernel.
-    /// Used to reject infeasible configs before compilation (GFX1100: 256 VGPRs max).
-    pub fn estimated_vgprs(&self) -> u32 {
+    /// Estimated VGPR usage for LDS double-buffer kernel on a specific target.
+    pub fn estimated_vgprs_for_target(&self, target: Target) -> u32 {
         let nrb = self.n_row_blocks() as u32;
         let nct = self.n_col_tiles() as u32;
         let x_lpt = self.x_bytes_per_thread() / 16; // b128 loads for X
         let wt_lpt = self.wt_bytes_per_thread() / 16; // b128 loads for WT
-        let acc = nrb * nct * 8;          // accumulator groups
-        let x_frag = nrb * 8;              // X WMMA fragments
-        let wt_frag = nct * 8;             // WT WMMA fragments
+        let wmma = WmmaFormat::BF16_F32;
+        let acc = nrb * nct * wmma.dst_vreg_count(target);
+        let x_frag = nrb * wmma.a_vreg_count(target);
+        let wt_frag = nct * wmma.b_vreg_count(target);
         let gmem_x = x_lpt * 4;            // GMEM load regs for X (b128 = 4 VGPRs)
         let gmem_wt = wt_lpt * 4;          // GMEM load regs for WT
         let addr_temps = 49;               // address computation, LDS offsets, store temps
         acc + x_frag + wt_frag + gmem_x + gmem_wt + addr_temps
     }
-    /// Check if this config is feasible on GFX1100 (VGPR limit = 256).
+
+    /// Estimated VGPR usage for the active target context.
+    pub fn estimated_vgprs(&self) -> u32 {
+        self.estimated_vgprs_for_target(current_target())
+    }
+
+    /// Check if this config is feasible on a specific target.
+    pub fn is_feasible_for_target(&self, target: Target) -> bool {
+        self.estimated_vgprs_for_target(target) <= 256
+    }
+
+    /// Check if this config is feasible on the active target context.
     pub fn is_feasible(&self) -> bool {
-        self.estimated_vgprs() <= 256
+        self.is_feasible_for_target(current_target())
     }
     /// Descriptive name
     pub fn name(&self) -> String {
@@ -251,16 +262,18 @@ pub fn sweep_configs() -> Vec<GemmConfig> {
 /// Returns (kernel, lds_size, workgroup_size, grid_fn) where grid_fn
 /// computes grid dimensions for a given (M, N).
 pub fn generate(cfg: &GemmConfig) -> T0Kernel {
-    // Safety check: reject configs that exceed GFX1100 VGPR limit
-    let est_vgprs = cfg.estimated_vgprs();
-    if est_vgprs > 256 {
+    let target = current_target();
+    let wmma = WmmaFormat::BF16_F32;
+    let max_vgprs = 256u32;
+    let est_vgprs = cfg.estimated_vgprs_for_target(target);
+    if est_vgprs > max_vgprs {
         panic!(
-            "[gemm_gen] Config '{}' requires ~{} VGPRs (max 256). \
+            "[gemm_gen] Config '{}' on {:?} requires ~{} VGPRs (max {}). \
              Use n_col_passes=2 or smaller tile. Breakdown: acc={}, x_frag={}, wt_frag={}, gmem={}, temps=49",
-            cfg.name(), est_vgprs,
-            cfg.n_row_blocks() as u32 * cfg.n_col_tiles() as u32 * 8,
-            cfg.n_row_blocks() as u32 * 8,
-            cfg.n_col_tiles() as u32 * 8,
+            cfg.name(), target, est_vgprs, max_vgprs,
+            cfg.n_row_blocks() as u32 * cfg.n_col_tiles() as u32 * wmma.dst_vreg_count(target),
+            cfg.n_row_blocks() as u32 * wmma.a_vreg_count(target),
+            cfg.n_col_tiles() as u32 * wmma.b_vreg_count(target),
             cfg.x_bytes_per_thread() / 16 * 4 + cfg.wt_bytes_per_thread() / 16 * 4,
         );
     }
@@ -1358,4 +1371,23 @@ fn generate_direct(cfg: &GemmConfig) -> T0Kernel {
     lds_cfg.use_lds = true;
     lds_cfg.double_buffer = true;
     generate_lds_db(&lds_cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimated_vgprs_respects_gfx1201_frag_sizes() {
+        let cfg = GemmConfig::tile_128x64_k16();
+        assert_eq!(cfg.estimated_vgprs_for_target(Target::GFX1100), 265);
+        assert_eq!(cfg.estimated_vgprs_for_target(Target::GFX1201), 233);
+    }
+
+    #[test]
+    fn test_feasibility_differs_by_target() {
+        let cfg = GemmConfig::tile_128x64_k16();
+        assert!(!cfg.is_feasible_for_target(Target::GFX1100));
+        assert!(cfg.is_feasible_for_target(Target::GFX1201));
+    }
 }

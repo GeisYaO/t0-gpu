@@ -951,6 +951,7 @@ impl T0Kernel {
 
             // Register allocate on optimized ops with filtered allocs
             let mut final_lds_size = self.lds_size;
+            let mut had_spills = false;
             let alloc = if self.use_ssa_regalloc {
                 let func = super::ssa_ir::lift_to_ssa(&optimized_ops);
                 let intervals = super::ssa_ir::compute_live_intervals(&func, &filtered_allocs);
@@ -964,6 +965,7 @@ impl T0Kernel {
                 );
 
                 if !ssa_alloc.spills.is_empty() {
+                    had_spills = true;
                     let spill_result = super::ssa_regalloc::insert_spill_reloads(
                         &mut optimized_ops, &ssa_alloc, self.lds_size, self.wg_size,
                     );
@@ -1022,26 +1024,28 @@ impl T0Kernel {
 
             // Post-regalloc WMMA alignment validation
             // (pre-regalloc verifier can't check this since it sees virtual VRegs)
-            for (i, op) in optimized_ops.iter().enumerate() {
-                if let Op::Wmma { dst, a, b, c, format } = op {
-                    for (name, vreg, align) in [
-                        ("dst", dst, format.dst_alignment(target)),
-                        ("a", a, format.a_alignment(target)),
-                        ("b", b, format.b_alignment(target)),
-                        ("c", c, format.c_alignment(target)),
-                    ] {
-                        let align_bytes = match align {
-                            Alignment::None => 1,
-                            Alignment::Align2 => 2,
-                            Alignment::Align4 => 4,
-                            Alignment::Align8 => 8,
-                        };
-                        if let Some(&phys) = alloc.vgpr_map.get(vreg) {
-                            if (phys as u32) % align_bytes != 0 {
-                                eprintln!(
-                                    "[T0 ERROR] Op[{}]: WMMA '{}' VReg({})→v{} NOT {}-aligned on {}.",
-                                    i, name, vreg.0, phys, align_bytes, target.mcpu_str()
-                                );
+            if !had_spills {
+                for (i, op) in optimized_ops.iter().enumerate() {
+                    if let Op::Wmma { dst, a, b, c, format } = op {
+                        for (name, vreg, align) in [
+                            ("dst", dst, format.dst_alignment(target)),
+                            ("a", a, format.a_alignment(target)),
+                            ("b", b, format.b_alignment(target)),
+                            ("c", c, format.c_alignment(target)),
+                        ] {
+                            let align_bytes = match align {
+                                Alignment::None => 1,
+                                Alignment::Align2 => 2,
+                                Alignment::Align4 => 4,
+                                Alignment::Align8 => 8,
+                            };
+                            if let Some(&phys) = alloc.vgpr_map.get(vreg) {
+                                if (phys as u32) % align_bytes != 0 {
+                                    eprintln!(
+                                        "[T0 ERROR] Op[{}]: WMMA '{}' VReg({})→v{} NOT {}-aligned on {}.",
+                                        i, name, vreg.0, phys, align_bytes, target.mcpu_str()
+                                    );
+                                }
                             }
                         }
                     }

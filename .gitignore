@@ -8,5 +8,5 @@ Cargo.lock
 librocdxg
 libdxg
 prompt.txt
-log
+log*
 .codex
